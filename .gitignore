@@ -52,3 +52,10 @@ book/
 **/index.html
 compile_commands.json
 .cache/
+*.bak
+*.deb
+
+Lab*/.local/
+Thirdparty/musl-libc/config.mak
+Thirdparty/musl-libc/lib/
+Thirdparty/musl-libc/obj/
