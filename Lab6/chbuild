@@ -12,6 +12,9 @@
 set -e
 
 self=$0
+script_dir="$(cd -- "$(dirname -- "$self")" && pwd)"
+docker_cmd="${DOCKER_CMD:-$script_dir/../Scripts/docker.sh}"
+docker_image="${DOCKER_IMAGE:-ipads/oslab:25.03}"
 
 defconfig_command="$self defconfig"
 clean_command="$self clean"
@@ -275,10 +278,10 @@ _docker_run() {
         fi
         echo "chbuild: use_cgroup: $use_cgroup, tags: $CI_RUNNER_TAGS"
         test -t 1 && use_tty="-t"
-        docker run -i $use_tty --rm \
+        "$docker_cmd" run -i $use_tty --rm \
             -u $(id -u ${USER}):$(id -g ${USER}) \
             -v $(pwd):$(pwd) -w $(pwd) \
-            ipads/oslab:24.09 \
+            "$docker_image" \
             $self $@
     fi
 }

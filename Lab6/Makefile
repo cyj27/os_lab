@@ -10,10 +10,15 @@ QEMU_GDB_PORT := 1234
 KEYBOARD_PORT := 10010
 MOUSE_PORT := 10011
 QEMU_OPTS := -machine raspi4b -serial null -serial mon:stdio -serial tcp::$(KEYBOARD_PORT),server,nowait -serial tcp::$(MOUSE_PORT),server,nowait -m size=2G -kernel $(KERNEL_IMG)
+ifeq ($(shell command -v gdb-multiarch 2> /dev/null),)
+GDB := gdb
+else
 GDB := gdb-multiarch
+endif
 CHBUILD := $(PROJECT_DIR)/chbuild
 QEMU_IMG := ipads/chcore_lab_qemu:v1.0
-DOCKER_RUN_CMD := docker run \
+DOCKER_CMD := $(PROJECT_DIR)/../Scripts/docker.sh
+DOCKER_RUN_CMD := $(DOCKER_CMD) run \
 	--rm \
 	-e DISPLAY=$(DISPLAY) \
 	-u $$(id -u $${USER}):$$(id -g $${USER}) \
@@ -70,7 +75,7 @@ distclean:
 	$(V)rm -rf $(PROJECT_DIR)/kernel
 	$(V)rm -rf $(PROJECT_DIR)/ramdisk	
 
-.PHONY: qemu qemu-gdb gdb
+.PHONY: qemu qemu-gdb gdb doctor
 
 qemu:	
 	$(V)xhost +
@@ -82,3 +87,5 @@ qemu-gdb:
 gdb:
 	$(V)$(GDB) -x $(PROJECT_DIR)/.gdbinit
 
+doctor:
+	$(V)bash $(PROJECT_DIR)/../Scripts/doctor.sh

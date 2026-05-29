@@ -10,9 +10,18 @@ BUILDDIR := $(LABDIR)/build
 KERNEL_IMG := $(BUILDDIR)/kernel.img
 _QEMU := $(SCRIPTS)/qemu_wrapper.sh $(QEMU)
 QEMU_GDB_PORT := 1234
-QEMU_OPTS := -machine raspi3b -nographic -serial mon:stdio -m size=1G -kernel $(KERNEL_IMG)
-CHBUILD := $(SCRIPTS)/chbuild
-SERIAL := $(shell tr -dc A-Za-z0-9 </dev/urandom | head -c 13; echo)
+ifeq ($(HAS_KVM),1)
+QEMU_ACCEL :=
+else
+QEMU_ACCEL := -accel tcg,thread=multi
+endif
+QEMU_OPTS := $(QEMU_ACCEL) -machine raspi3b -nographic -serial mon:stdio -m size=1G -kernel $(KERNEL_IMG)
+ifeq ($(CAN_USE_DOCKER),)
+	CHBUILD := $(SCRIPTS)/chbuild --local
+else
+	CHBUILD := $(SCRIPTS)/chbuild
+endif
+SERIAL := $(shell python3 -c "import secrets, string; a = string.ascii_letters + string.digits; print(''.join(secrets.choice(a) for _ in range(13)))")
 
 export LABROOT LABDIR SCRIPTS LAB TIMEOUT
 
@@ -26,7 +35,7 @@ build:
 	$(Q)$(CHBUILD) build
 	$(Q)find $(LABDIR) -path */compile_commands.json \
        ! -path $(LABDIR)/compile_commands.json -print \
-	   | $(SCRIPTS)/merge_compile_commands.py
+	   | python3 $(SCRIPTS)/merge_compile_commands.py
 
 clean:
 	$(Q)$(CHBUILD) clean
@@ -54,4 +63,7 @@ grade:
 	$(Q)$(DOCKER_RUN) $(GRADER) -t $(TIMEOUT)
 	$(Q)(test -f ${LABDIR}/.config.bak && cp ${LABDIR}/.config.bak ${LABDIR}/.config && rm .config.bak) || :
 
-.PHONY: qemu qemu-gdb gdb defconfig build clean distclean grade all
+doctor:
+	$(Q)bash $(SCRIPTS)/doctor.sh
+
+.PHONY: qemu qemu-gdb gdb defconfig build clean distclean grade doctor all

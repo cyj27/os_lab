@@ -11,6 +11,7 @@
  */
 
 #include <common/macro.h>
+#include <common/backtrace.h>
 #include <common/types.h>
 #include <common/kprint.h>
 #include <common/lock.h>
@@ -139,7 +140,16 @@ static void choose_new_current_slab(struct slab_pointer * __maybe_unused pool)
         /* LAB 2 TODO 2 BEGIN */
         /* Hint: Choose a partial slab to be a new current slab. */
         /* BLANK BEGIN */
-
+        struct list_head *list = &pool->partial_slab_list;
+        if (list_empty(list)) {
+                pool->current_slab = NULL;
+                return;
+        } else {
+                struct slab_header *slab;
+                slab = (struct slab_header *)list_entry(list->next, struct slab_header, node);
+                pool->current_slab = slab;
+                list_del(&slab->node);
+        }
         /* BLANK END */
         /* LAB 2 TODO 2 END */
 }
@@ -170,7 +180,17 @@ static void *alloc_in_slab_impl(int order)
          * If current slab is full, choose a new slab as the current one.
          */
         /* BLANK BEGIN */
-
+        free_list = (struct slab_slot_list *)current_slab->free_list_head;
+        if (free_list == NULL) {
+                choose_new_current_slab(&slab_pool[order]);
+                current_slab = slab_pool[order].current_slab;
+                BUG_ON(current_slab == NULL);
+                free_list = (struct slab_slot_list *)slab_pool[order].current_slab->free_list_head;
+        }
+        current_slab->free_list_head = free_list->next_free;
+        current_slab->current_free_cnt--;
+        if (unlikely(current_slab->current_free_cnt == 0))
+                choose_new_current_slab(&slab_pool[order]);
         /* BLANK END */
         /* LAB 2 TODO 2 END */
 
@@ -296,6 +316,9 @@ void free_in_slab(void *addr)
         /*
          * Hint: Free an allocated slot and put it back to the free list.
          */
+        slot->next_free = slab->free_list_head;
+        slab->free_list_head = slot;
+        slab->current_free_cnt += 1;
         /* BLANK BEGIN */
 
         UNUSED(slot);

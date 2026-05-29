@@ -13,7 +13,7 @@ SCRIPTS=${LABROOT}/Scripts
 info "Grading lab ${LAB} ...(may take ${TIMEOUT} seconds)"
 
 bold "==========================================="
-${SCRIPTS}/expect.py $@
+python3 ${SCRIPTS}/expect.py $@
 score=$?
 
 if [[ $score -eq 255 ]]; then

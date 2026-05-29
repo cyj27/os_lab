@@ -27,10 +27,17 @@ endif
 
 DOCKER ?= docker
 DOCKER_IMAGE ?= ipads/oslab:25.03
-ifeq (,$(wildcard /docker.env))
-DOCKER_RUN ?= 
+DOCKER_CMD := $(SCRIPTS)/docker.sh
+HAS_DOCKER := $(shell command -v $(DOCKER) 2>/dev/null)
+CAN_USE_DOCKER := $(shell $(DOCKER_CMD) info >/dev/null 2>&1 && echo 1)
+HAS_KVM := $(shell test -e /dev/kvm && echo 1 || echo 0)
+ifeq ($(CAN_USE_DOCKER),)
+DOCKER_RUN ?=
 else
-DOCKER_RUN ?= $(DOCKER) run -it --rm \
+ifneq ($(wildcard /.dockerenv)$(wildcard /run/.containerenv),)
+DOCKER_RUN ?=
+else
+DOCKER_RUN ?= $(DOCKER_CMD) run -it --rm \
 		-e SCRIPTS=$(SCRIPTS) \
 		-e LABROOT=$(LABROOT) \
 		-e LABDIR=$(LABDIR) \
@@ -42,11 +49,16 @@ DOCKER_RUN ?= $(DOCKER) run -it --rm \
 		--platform=linux/amd64 \
 		$(DOCKER_IMAGE)
 endif
+endif
 QEMU-SYS ?= qemu-system-aarch64
 QEMU-USER ?= qemu-aarch64
 
 # Timeout for grading
-TIMEOUT ?= 10
+ifeq ($(HAS_KVM),1)
+	TIMEOUT ?= 10
+else
+	TIMEOUT ?= 600
+endif
 
 ifeq ($(shell test $(LAB) -eq 0; echo $$?),1)
 	QEMU := $(QEMU-SYS)

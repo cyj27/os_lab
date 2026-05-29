@@ -11,6 +11,9 @@
 set -e
 
 self=$0
+script_dir="$(cd -- "$(dirname -- "$self")" && pwd)"
+docker_cmd="${DOCKER_CMD:-$script_dir/docker.sh}"
+docker_image="${DOCKER_IMAGE:-ipads/oslab:25.03}"
 
 defconfig_command="make defconfig"
 clean_command="make clean or make distclean"
@@ -274,13 +277,14 @@ _docker_run() {
         fi
         echo "chbuild: use_cgroup: $use_cgroup, tags: $CI_RUNNER_TAGS"
         test -t 1 && use_tty="-t"
-        docker run -i $use_tty --rm \
+        "$docker_cmd" run -i $use_tty --rm \
             -e SCRIPTS=$SCRIPTS \
+            -e DOCKER_IMAGE="$docker_image" \
             -u $(id -u ${USER}):$(id -g ${USER}) \
             -v ${LABROOT}:${LABROOT} -w $(pwd) \
             --security-opt=seccomp:unconfined \
             --platform=linux/amd64 \
-            ipads/oslab:24.09 \
+            "$docker_image" \
             $self $@
     fi
 }

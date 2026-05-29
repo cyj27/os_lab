@@ -27,7 +27,7 @@ cp "${CMAKE_EXTRA_DIR}/cmake-fs_base-part1.txt" "${FS_BASE_DIR}/CMakeLists.txt"
 make distclean &> /dev/null
 make build &> /dev/null
 info "Grading part 1 ...(may take $var2 seconds)"
-${SCRIPTS}/expect.py -f ${LABDIR}/scores-part1.json -t $var2 make qemu-grade
+python3 ${SCRIPTS}/expect.py -f ${LABDIR}/scores-part1.json -t $var2 make qemu-grade
 #${SCRIPTS}/expect.py -f ${LABDIR}/scores-part1.json -t 60 make qemu-grade 2> /dev/null
 score=$(($score+$?))
 if [[ $score -eq 255 ]]; then
@@ -40,7 +40,7 @@ cp "${CMAKE_EXTRA_DIR}/cmake-fs_base-part2-vnode.txt" "${FS_BASE_DIR}/CMakeLists
 make distclean &> /dev/null
 make build &> /dev/null
 info "Grading part 2 ...(may take $var3 seconds)"
-${SCRIPTS}/expect.py -f ${LABDIR}/scores-part2.json -t $var3 make qemu-grade
+python3 ${SCRIPTS}/expect.py -f ${LABDIR}/scores-part2.json -t $var3 make qemu-grade
 #${SCRIPTS}/expect.py -f ${LABDIR}/scores-part2.json -t 60 make qemu-grade 2> /dev/null
 score=$(($score+$?))
 if [[ $score -eq 255 ]]; then
@@ -55,7 +55,7 @@ cp "${CMAKE_EXTRA_DIR}/cmake-fs_base-part2-server_entry.txt" "${FS_BASE_DIR}/CMa
 make distclean &> /dev/null
 make build &> /dev/null
 info "Grading part 3 ...(may take $var4 seconds)"
-${SCRIPTS}/expect.py -f ${LABDIR}/scores-part3.json -t $var4 make qemu-grade
+python3 ${SCRIPTS}/expect.py -f ${LABDIR}/scores-part3.json -t $var4 make qemu-grade
 #${SCRIPTS}/expect.py -f ${LABDIR}/scores-part3.json -t 60 make qemu-grade 2> /dev/null
 score=$(($score+$?))
 if [[ $score -eq 255 ]]; then
@@ -69,7 +69,7 @@ mv "${FS_BASE_DIR}/CMakeLists.txt.bak" "${FS_BASE_DIR}/CMakeLists.txt"
 make distclean &> /dev/null
 make build &> /dev/null
 info "Grading part 4 ...(may take $var5 seconds)"
-${SCRIPTS}/expect.py -f ${LABDIR}/scores-part4.json -t $var5 make qemu-grade
+python3 ${SCRIPTS}/expect.py -f ${LABDIR}/scores-part4.json -t $var5 make qemu-grade
 #${SCRIPTS}/expect.py -f ${LABDIR}/scores-part4.json -t 60 make qemu-grade 2> /dev/null
 score=$(($score+$?))
 if [[ $score -eq 255 ]]; then

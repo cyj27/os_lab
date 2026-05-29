@@ -18,7 +18,12 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
+import re
+import select
+import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import TypedDict
@@ -32,50 +37,40 @@ if sys.version_info[0] != 3 or sys.version_info[1] < 6:
 try:
     import pexpect
 except ImportError:
-    print(
-        "This script requires pexpect as the main dependency. Please install this module first."
-    )
-    sys.exit(255)
+    pexpect = None
 
 
-class Colors(Enum):
+def _color(code: str) -> str:
+    return code if sys.stdout.isatty() else ""
+
+
+class Colors:
     """ANSI color codes"""
 
-    BLACK = "\033[0;30m"
-    RED = "\033[0;31m"
-    GREEN = "\033[0;32m"
-    BROWN = "\033[0;33m"
-    BLUE = "\033[0;34m"
-    PURPLE = "\033[0;35m"
-    CYAN = "\033[0;36m"
-    LIGHT_GRAY = "\033[0;37m"
-    DARK_GRAY = "\033[1;30m"
-    LIGHT_RED = "\033[1;31m"
-    LIGHT_GREEN = "\033[1;32m"
-    YELLOW = "\033[1;33m"
-    LIGHT_BLUE = "\033[1;34m"
-    LIGHT_PURPLE = "\033[1;35m"
-    LIGHT_CYAN = "\033[1;36m"
-    LIGHT_WHITE = "\033[1;37m"
-    BOLD = "\033[1m"
-    FAINT = "\033[2m"
-    ITALIC = "\033[3m"
-    UNDERLINE = "\033[4m"
-    BLINK = "\033[5m"
-    NEGATIVE = "\033[7m"
-    CROSSED = "\033[9m"
-    END = "\033[0m"
-    # cancel SGR codes if we don't write to a terminal
-    if not __import__("sys").stdout.isatty():
-        for _ in dir():
-            if isinstance(_, str) and _[0] != "_":
-                locals()[_] = ""
-    else:
-        # set Windows console in VT mode
-        if __import__("platform").system() == "Windows":
-            kernel32 = __import__("ctypes").windll.kernel32
-            kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
-            del kernel32
+    BLACK = _color("\033[0;30m")
+    RED = _color("\033[0;31m")
+    GREEN = _color("\033[0;32m")
+    BROWN = _color("\033[0;33m")
+    BLUE = _color("\033[0;34m")
+    PURPLE = _color("\033[0;35m")
+    CYAN = _color("\033[0;36m")
+    LIGHT_GRAY = _color("\033[0;37m")
+    DARK_GRAY = _color("\033[1;30m")
+    LIGHT_RED = _color("\033[1;31m")
+    LIGHT_GREEN = _color("\033[1;32m")
+    YELLOW = _color("\033[1;33m")
+    LIGHT_BLUE = _color("\033[1;34m")
+    LIGHT_PURPLE = _color("\033[1;35m")
+    LIGHT_CYAN = _color("\033[1;36m")
+    LIGHT_WHITE = _color("\033[1;37m")
+    BOLD = _color("\033[1m")
+    FAINT = _color("\033[2m")
+    ITALIC = _color("\033[3m")
+    UNDERLINE = _color("\033[4m")
+    BLINK = _color("\033[5m")
+    NEGATIVE = _color("\033[7m")
+    CROSSED = _color("\033[9m")
+    END = _color("\033[0m")
 
 
 @dataclass
@@ -127,6 +122,59 @@ def load_captures(file: str, in_kernel: bool) -> list[LineExpect]:
     return captures
 
 
+def expect_with_subprocess(
+    command: list[str], patterns: list[str], timeout: int, verbose: bool
+) -> list[int]:
+    matched_indices: list[int] = []
+    compiled_patterns = [re.compile(pattern) for pattern in patterns]
+    process = subprocess.Popen(
+        " ".join(command),
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+    if process.stdout is None:
+        return matched_indices
+
+    fd = process.stdout.fileno()
+    buffer = ""
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        remaining = max(0.1, deadline - time.time())
+        ready, _, _ = select.select([fd], [], [], min(0.1, remaining))
+        if ready:
+            chunk = os.read(fd, 4096).decode("utf-8", errors="replace")
+            if not chunk:
+                break
+            if verbose:
+                print(chunk, end="")
+            buffer += chunk
+
+            while True:
+                matched = False
+                for i, pattern in enumerate(compiled_patterns):
+                    match = pattern.search(buffer)
+                    if match is None:
+                        continue
+                    matched_indices.append(i)
+                    buffer = buffer[match.end() :]
+                    matched = True
+                    break
+                if not matched:
+                    # Keep the tail to match patterns spanning chunk boundaries.
+                    buffer = buffer[-4096:]
+                    break
+        elif process.poll() is not None:
+            break
+
+    process.terminate()
+    process.wait(timeout=1)
+    return matched_indices
+
+
 def main(args: argparse.Namespace):
     """Main grading function."""
 
@@ -147,35 +195,53 @@ def main(args: argparse.Namespace):
         expect_lines += [f"End of Kernel Checkpoints: {args.serial}.*"]
 
     logging.debug(f"Expecting: {expect_lines}")
-    process = pexpect.spawn(
-        " ".join(args.command), timeout=args.timeout, encoding="utf-8"
-    )
-    process.logfile = sys.stdout if args.verbose else None
     proposed_total = sum([capture.proposed for capture in captures])
     in_userland = not is_kernel_test
     scores = 0
 
     if len(expect_lines) > 0:
-        while scores < proposed_total:
-            try:
-                i = process.expect(expect_lines)
+        if pexpect is not None:
+            process = pexpect.spawn(
+                " ".join(args.command), timeout=args.timeout, encoding="utf-8"
+            )
+            process.logfile = sys.stdout if args.verbose else None
+            while scores < proposed_total:
+                try:
+                    i = process.expect(expect_lines)
 
+                    logging.debug(f"Matched: {expect_lines[i]}")
+                    if i == len(expect_lines) - 1 and is_kernel_test:
+                        logging.debug("End of Kernel Checkpoints detected.")
+                        in_userland = True
+                    else:
+                        if in_userland == captures[i].userland and captures[i].actual == 0:
+                            captures[i].actual = captures[i].proposed
+                            scores += captures[i].actual
+                        else:
+                            logging.debug(
+                                f"Userland Mismatch or duplicate: {in_userland} != {captures[i].userland}"
+                            )
+                except (pexpect.EOF, pexpect.TIMEOUT, KeyboardInterrupt):
+                    break
+            process.close()
+        else:
+            logging.debug("pexpect unavailable, falling back to subprocess mode.")
+            matched_indices = expect_with_subprocess(
+                args.command, expect_lines, args.timeout, args.verbose
+            )
+            for i in matched_indices:
                 logging.debug(f"Matched: {expect_lines[i]}")
                 if i == len(expect_lines) - 1 and is_kernel_test:
                     logging.debug("End of Kernel Checkpoints detected.")
                     in_userland = True
                 else:
-                    if in_userland == captures[i].userland:
+                    if in_userland == captures[i].userland and captures[i].actual == 0:
                         captures[i].actual = captures[i].proposed
                         scores += captures[i].actual
                     else:
                         logging.debug(
-                            f"Userland Mismatch: {in_userland} != {captures[i].userland}"
+                            f"Userland Mismatch or duplicate: {in_userland} != {captures[i].userland}"
                         )
-            except (pexpect.EOF, pexpect.TIMEOUT, KeyboardInterrupt):
-                break
-
-    process.close()
 
     for capture in captures:
         print(f"{capture.msg}: {capture.actual}/{capture.proposed}")
@@ -232,7 +298,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     log_level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(
-        format=f"{Colors.GREEN.value}[EXPECT]: %(message)s{Colors.END.value}",
+        format=f"{Colors.GREEN}[EXPECT]: %(message)s{Colors.END}",
         level=log_level,
     )
     scores = main(args)

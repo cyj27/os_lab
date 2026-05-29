@@ -14,9 +14,18 @@ BUILDDIR := $(LABDIR)/build
 KERNEL_IMG := $(BUILDDIR)/kernel.img
 _QEMU := $(SCRIPTS)/qemu_wrapper.sh $(QEMU)
 QEMU_GDB_PORT := 1234
-QEMU_OPTS := -machine raspi3b -nographic -serial mon:stdio -m size=1G -kernel $(KERNEL_IMG)
-CHBUILD := $(SCRIPTS)/chbuild
-SERIAL := $(shell LC_ALL=C tr -dc A-Za-z0-9 </dev/urandom | head -c 13; echo)
+ifeq ($(HAS_KVM),1)
+QEMU_ACCEL :=
+else
+QEMU_ACCEL := -accel tcg,thread=multi
+endif
+QEMU_OPTS := $(QEMU_ACCEL) -machine raspi3b -nographic -serial mon:stdio -m size=1G -kernel $(KERNEL_IMG)
+ifeq ($(CAN_USE_DOCKER),)
+	CHBUILD := $(SCRIPTS)/chbuild --local
+else
+	CHBUILD := $(SCRIPTS)/chbuild
+endif
+SERIAL := $(shell python3 -c "import secrets, string; a = string.ascii_letters + string.digits; print(''.join(secrets.choice(a) for _ in range(13)))")
 
 export LABROOT LABDIR SCRIPTS LAB TIMEOUT
 
@@ -30,7 +39,7 @@ build:
 	$(Q)$(CHBUILD) build
 	$(Q)find -L $(LABDIR) -path */compile_commands.json \
        ! -path $(LABDIR)/compile_commands.json -print \
-	   | $(SCRIPTS)/merge_compile_commands.py
+	   | python3 $(SCRIPTS)/merge_compile_commands.py
 
 clean:
 	$(Q)$(CHBUILD) clean
@@ -53,11 +62,27 @@ qemu-gdb: build
 gdb:
 	$(Q)$(GDB) --nx -x $(SCRIPTS)/gdb/gdbinit
 
-grade:  
-	$(Q)$(MAKE) distclean &> /dev/null
+official-grade-local:
+	$(Q)$(MAKE) distclean >/dev/null 2>&1
 	$(Q)(test -f $(LABDIR)/.config && cp $(LABDIR)/.config $(LABDIR)/.config.bak) || :
 	$(Q)$(MAKE) build
-	$(Q)$(DOCKER_RUN) $(GRADER) -t $(TIMEOUT) -f $(LABDIR)/scores.json $(GRADER_V) -s $(SERIAL) make SERIAL=$(SERIAL) qemu-grade
-	$(Q)(test -f $(LABDIR)/.config.bak && cp $(LABDIR)/.config.bak $(LABDIR)/.config && rm .config.bak) || :
+	$(Q)$(GRADER) -t $(TIMEOUT) -f $(LABDIR)/scores.json $(GRADER_V) -s $(SERIAL) make SERIAL=$(SERIAL) qemu-grade
+	$(Q)(test -f $(LABDIR)/.config.bak && cp $(LABDIR)/.config.bak $(LABDIR)/.config && rm $(LABDIR)/.config.bak) || :
 
-.PHONY: qemu qemu-gdb gdb defconfig build clean distclean grade all
+grade:
+	$(Q)if test -n "$(CAN_USE_DOCKER)"; then \
+		$(MAKE) distclean >/dev/null 2>&1; \
+		(test -f $(LABDIR)/.config && cp $(LABDIR)/.config $(LABDIR)/.config.bak) || :; \
+		$(MAKE) build; \
+		$(DOCKER_RUN) $(GRADER) -t $(TIMEOUT) -f $(LABDIR)/scores.json $(GRADER_V) -s $(SERIAL) make SERIAL=$(SERIAL) qemu-grade; \
+		(test -f $(LABDIR)/.config.bak && cp $(LABDIR)/.config.bak $(LABDIR)/.config && rm $(LABDIR)/.config.bak) || :; \
+	else \
+		echo "[grade] Docker unavailable; running the official grader locally."; \
+		echo "[grade] This still uses scores.json + expect.py + qemu-grade."; \
+		$(MAKE) official-grade-local; \
+	fi
+
+doctor:
+	$(Q)bash $(SCRIPTS)/doctor.sh
+
+.PHONY: qemu qemu-gdb gdb defconfig build clean distclean grade official-grade-local doctor all
