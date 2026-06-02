@@ -609,9 +609,11 @@ tryldflag LDFLAGS_AUTO -Wl,--exclude-libs=ALL
 tryldflag LDFLAGS_AUTO -Wl,--dynamic-list="$srcdir/dynamic.list"
 
 # Find compiler runtime library
-if [[ $COMPILER == *"clang" ]]; then
+case "$COMPILER" in
+*clang*)
         LIBCC="-lclang_rt.builtins"
-fi
+        ;;
+esac
 test -z "$LIBCC" && tryldflag LIBCC -lgcc && tryldflag LIBCC -lgcc_eh
 test -z "$LIBCC" && tryldflag LIBCC -lcompiler_rt
 test -z "$LIBCC" && try_libcc=`$CC -print-libgcc-file-name 2>/dev/null` \

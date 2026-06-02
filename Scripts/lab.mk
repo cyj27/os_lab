@@ -31,17 +31,18 @@ DOCKER_CMD := $(SCRIPTS)/docker.sh
 HAS_DOCKER := $(shell command -v $(DOCKER) 2>/dev/null)
 CAN_USE_DOCKER := $(shell $(DOCKER_CMD) info >/dev/null 2>&1 && echo 1)
 HAS_KVM := $(shell test -e /dev/kvm && echo 1 || echo 0)
+DOCKER_TTY := $(shell test -t 1 && echo -t)
 ifeq ($(CAN_USE_DOCKER),)
 DOCKER_RUN ?=
 else
 ifneq ($(wildcard /.dockerenv)$(wildcard /run/.containerenv),)
 DOCKER_RUN ?=
 else
-DOCKER_RUN ?= $(DOCKER_CMD) run -it --rm \
+DOCKER_RUN ?= $(DOCKER_CMD) run -i $(DOCKER_TTY) --rm \
 		-e SCRIPTS=$(SCRIPTS) \
 		-e LABROOT=$(LABROOT) \
 		-e LABDIR=$(LABDIR) \
-		-e TIMEOUT=$(TIMEOUT) \
+		-e "TIMEOUT=$(TIMEOUT)" \
 		-e LAB=$(LAB) \
 		-u $(shell id -u $(USER)):$(shell id -g $(USER)) \
 		-v $(LABROOT):$(LABROOT) -w $(CURDIR) \
