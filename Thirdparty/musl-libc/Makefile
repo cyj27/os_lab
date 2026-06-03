@@ -17,6 +17,9 @@ includedir = $(prefix)/include
 libdir = $(prefix)/lib
 syslibdir = /lib
 
+ohrootdir = ../../../../../../../
+teekerneldir = $(ohrootdir)/base/tee/tee_os_kernel
+
 MALLOC_DIR = mallocng
 SRC_DIRS = $(addprefix $(srcdir)/,src/* src/malloc/$(MALLOC_DIR) crt ldso $(COMPAT_SRC_DIRS))
 BASE_GLOBS = $(addsuffix /*.c,$(SRC_DIRS))
@@ -27,6 +30,9 @@ BASE_OBJS = $(patsubst $(srcdir)/%,%.o,$(basename $(BASE_SRCS)))
 ARCH_OBJS = $(patsubst $(srcdir)/%,%.o,$(basename $(ARCH_SRCS)))
 REPLACED_OBJS = $(sort $(subst /$(ARCH)/,/,$(ARCH_OBJS)))
 ALL_OBJS = $(addprefix obj/, $(filter-out $(REPLACED_OBJS), $(sort $(BASE_OBJS) $(ARCH_OBJS))))
+BOUNDS_CHECKING_OBJS = $(wildcard $(ohrootdir)/third_party/bounds_checking_function/obj/*)
+PWD = $(pwd)
+OH_TEE_OBJS = $(wildcard $(teekerneldir)/user/chcore-libs/sys-libs/libohtee/*.c.o)
 
 LIBC_OBJS = $(filter obj/src/%,$(ALL_OBJS)) $(filter obj/compat/%,$(ALL_OBJS))
 LDSO_OBJS = $(filter obj/ldso/%,$(ALL_OBJS:%.o=%.lo))
@@ -44,10 +50,10 @@ LIBCC = -lgcc
 CPPFLAGS =
 CFLAGS =
 CFLAGS_AUTO = -Os -pipe
-CFLAGS_C99FSE = -std=c99 -ffreestanding -nostdinc 
+CFLAGS_C99FSE = -std=c99 -ffreestanding -nostdinc
 
 CFLAGS_ALL = $(CFLAGS_C99FSE)
-CFLAGS_ALL += -D_XOPEN_SOURCE=700 -I$(srcdir)/arch/$(ARCH) -I$(srcdir)/arch/generic -Iobj/src/internal -I$(srcdir)/src/include -I$(srcdir)/src/internal -Iobj/include -I$(srcdir)/include
+CFLAGS_ALL += -D_XOPEN_SOURCE=700 -I$(srcdir)/arch/$(ARCH) -I$(srcdir)/arch/generic -Iobj/src/internal -I$(srcdir)/src/include -I$(srcdir)/src/internal -Iobj/include -I$(srcdir)/include -I$(UAPI_INCLUDE)
 CFLAGS_ALL += $(CPPFLAGS) $(CFLAGS_AUTO) $(CFLAGS)
 
 LDFLAGS_ALL = $(LDFLAGS_AUTO) $(LDFLAGS)
@@ -58,8 +64,9 @@ INSTALL = $(srcdir)/tools/install.sh
 
 ARCH_INCLUDES = $(wildcard $(srcdir)/arch/$(ARCH)/bits/*.h)
 GENERIC_INCLUDES = $(wildcard $(srcdir)/arch/generic/bits/*.h)
-INCLUDES = $(wildcard $(srcdir)/include/*.h $(srcdir)/include/*/*.h)
-ALL_INCLUDES = $(sort $(INCLUDES:$(srcdir)/%=%) $(GENH:obj/%=%) $(ARCH_INCLUDES:$(srcdir)/arch/$(ARCH)/%=include/%) $(GENERIC_INCLUDES:$(srcdir)/arch/generic/%=include/%))
+INCLUDES = $(wildcard $(srcdir)/include/*.h $(srcdir)/include/*/*.h $(srcdir)/include/*/*/*.h)
+UAPI_INCLUDES = $(wildcard $(UAPI_INCLUDE)/uapi/*.h $(UAPI_INCLUDE)/uapi/*/*.h)
+ALL_INCLUDES = $(sort $(INCLUDES:$(srcdir)/%=%) $(GENH:obj/%=%) $(ARCH_INCLUDES:$(srcdir)/arch/$(ARCH)/%=include/%) $(GENERIC_INCLUDES:$(srcdir)/arch/generic/%=include/%) $(UAPI_INCLUDES:$(UAPI_INCLUDE)/%=include/%))
 
 EMPTY_LIB_NAMES = m rt pthread crypt util xnet resolv dl
 EMPTY_LIBS = $(EMPTY_LIB_NAMES:%=lib/lib%.a)
@@ -78,6 +85,13 @@ LDSO_PATHNAME = $(syslibdir)/ld-musl-$(ARCH)$(SUBARCH).so.1
 -include config.mak
 -include $(srcdir)/arch/$(ARCH)/arch.mak
 
+# cross-compiling libc with clang
+ifeq (clang, $(findstring clang, $(CC)))
+	CFLAGS_ALL += -target ${TARGET}
+	LDFLAGS_ALL += -fuse-ld=lld
+	LIBCC = -lclang_rt.builtins
+endif
+
 ifeq ($(ARCH),)
 
 all:
@@ -90,7 +104,7 @@ all: $(ALL_LIBS) $(ALL_TOOLS)
 
 OBJ_DIRS = $(sort $(patsubst %/,%,$(dir $(ALL_LIBS) $(ALL_TOOLS) $(ALL_OBJS) $(GENH) $(GENH_INT))) obj/include)
 
-$(ALL_LIBS) $(ALL_TOOLS) $(ALL_OBJS) $(ALL_OBJS:%.o=%.lo) $(GENH) $(GENH_INT): | $(OBJ_DIRS)
+$(ALL_LIBS) $(ALL_TOOLS) $(ALL_OBJS) $(:%.o=%.lo) $(GENH) $(GENH_INT): | $(OBJ_DIRS)
 
 $(OBJ_DIRS):
 	mkdir -p $@
@@ -137,11 +151,11 @@ CC_CMD = $(CC) $(CFLAGS_ALL) -c -o $@ $<
 ifeq ($(ADD_CFI),yes)
 	AS_CMD = LC_ALL=C awk -f $(srcdir)/tools/add-cfi.common.awk -f $(srcdir)/tools/add-cfi.$(ARCH).awk $< | $(CC) $(CFLAGS_ALL) -x assembler -c -o $@ -
 else
-	AS_CMD = $(CC_CMD)
+	AS_CMD = $(CC) $(CFLAGS_ALL) -x assembler-with-cpp -c -o $@ $<
 endif
 
 obj/%.o: $(srcdir)/%.s
-	$(AS_CMD)
+	($(AS_CMD) 2> /dev/null) || $(CC_CMD)
 
 obj/%.o: $(srcdir)/%.S
 	$(CC_CMD)
@@ -150,7 +164,7 @@ obj/%.o: $(srcdir)/%.c $(GENH) $(IMPH)
 	$(CC_CMD)
 
 obj/%.lo: $(srcdir)/%.s
-	$(AS_CMD)
+	($(AS_CMD) 2> /dev/null) || $(CC_CMD)
 
 obj/%.lo: $(srcdir)/%.S
 	$(CC_CMD)
@@ -184,8 +198,16 @@ obj/musl-gcc: config.mak
 	printf '#!/bin/sh\nexec "$${REALGCC:-$(WRAPCC_GCC)}" "$$@" -specs "%s/musl-gcc.specs"\n' "$(libdir)" > $@
 	chmod +x $@
 
+obj/musl-ar: config.mak
+	printf '#!/bin/sh\nexec "$${REALAR:-$(AR)}"  "$$@"\n' "$(libdir)" > $@
+	chmod +x $@
+
+obj/musl-strip: config.mak
+	printf '#!/bin/sh\nexec "$${REALSTRIP:-$(CROSS_COMPILE)strip}"  "$$@"\n' "$(libdir)" > $@
+	chmod +x $@
+
 obj/%-clang: $(srcdir)/tools/%-clang.in config.mak
-	sed -e 's!@CC@!$(WRAPCC_CLANG)!g' -e 's!@PREFIX@!$(prefix)!g' -e 's!@INCDIR@!$(includedir)!g' -e 's!@LIBDIR@!$(libdir)!g' -e 's!@LDSO@!$(LDSO_PATHNAME)!g' $< > $@
+	sed -e 's!@CC@!$(WRAPCC_CLANG)!g' -e 's!@PREFIX@!$(prefix)!g' -e 's!@INCDIR@!$(includedir)!g' -e 's!@LIBDIR@!$(libdir)!g' -e 's!@LDSO@!$(LDSO_PATHNAME)!g' -e 's!@TARGET@!$(TARGET)!g' -e 's!@COMPILER_DIR@!$(COMPILER_DIR)!g'  $< > $@
 	chmod +x $@
 
 $(DESTDIR)$(bindir)/%: obj/%
@@ -207,6 +229,9 @@ $(DESTDIR)$(includedir)/bits/%: obj/include/bits/%
 	$(INSTALL) -D -m 644 $< $@
 
 $(DESTDIR)$(includedir)/%: $(srcdir)/include/%
+	$(INSTALL) -D -m 644 $< $@
+
+$(DESTDIR)$(includedir)/uapi/%: $(UAPI_INCLUDE)/uapi/%
 	$(INSTALL) -D -m 644 $< $@
 
 $(DESTDIR)$(LDSO_PATHNAME): $(DESTDIR)$(libdir)/libc.so

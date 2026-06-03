@@ -1,4 +1,5 @@
 #include "pthread_impl.h"
+#include <chcore/syscall.h>
 
 #define IS32BIT(x) !((x)+0x80000000ULL>>32)
 #define CLAMP(x) (int)(IS32BIT(x) ? (x) : 0x7fffffffU+((0ULL+(x))>>63))
@@ -89,4 +90,29 @@ int __pthread_mutex_timedlock(pthread_mutex_t *restrict m, const struct timespec
 	return r;
 }
 
-weak_alias(__pthread_mutex_timedlock, pthread_mutex_timedlock);
+int __pthread_mutex_timedlock_ceiling_wrapper(pthread_mutex_t *restrict m, const struct timespec *restrict at)
+{
+	int cur_prio = 0, r;
+	bool set_ceil = false;
+
+	if (m->ceil) {
+		cur_prio = usys_get_prio(0);
+
+		if (cur_prio < m->ceil) {
+			set_ceil = true;
+			usys_set_prio(0, m->ceil);
+		}
+	}
+
+	r = __pthread_mutex_timedlock(m, at);
+
+	if (set_ceil) {
+		if (!r)
+			m->old_prio = cur_prio;
+		else
+			usys_set_prio(0, cur_prio);
+	}
+	return r;
+}
+
+weak_alias(__pthread_mutex_timedlock_ceiling_wrapper, pthread_mutex_timedlock);

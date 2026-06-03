@@ -6,6 +6,8 @@ cleared=
 shared=
 userlinkdir=
 userlink=
+target="@TARGET@"
+compiler_dir="@COMPILER_DIR@"
 
 for x ; do
     test "$cleared" || set -- ; cleared=1
@@ -26,12 +28,27 @@ for x ; do
         -l-user-end)
             userlink=
             ;;
-        crtbegin*.o|crtend*.o)
-            set -- "$@" $($cc -print-file-name=$x)
+        crtbegin*.o)
+            set -- "$@" $(dirname $0)/../../lib/crt1.o $(dirname $0)/../../lib/crti.o $compiler_dir/../lib/aarch64-linux-ohos/clang_rt.crtbegin.o
+            ;;
+        crti.o)
+            set -- "$@" $(dirname $0)/../../lib/crti.o
+            ;;
+        crtn.o)
+            set -- "$@" $(dirname $0)/../../lib/crtn.o
+            ;;
+        crt1.o)
+            set -- "$@" $(dirname $0)/../../lib/crt1.o
+            ;;
+        Scrt1.o)
+            set -- "$@" $(dirname $0)/../../lib/Scrt1.o
+            ;;
+        crtend*.o)
+            set -- "$@" $compiler_dir/../lib/aarch64-linux-ohos/clang_rt.crtend.o $(dirname $0)/../../lib/crtn.o
             ;;
         -lgcc|-lgcc_eh)
             file=lib${x#-l}.a
-            set -- "$@" $($cc -print-file-name=$file)
+            set -- "$@" -lclang_rt.builtins -L$compiler_dir/../lib/aarch64-linux-ohos
             ;;
         -l*)
             test "$userlink" && set -- "$@" "$x"
@@ -48,4 +65,4 @@ for x ; do
     esac
 done
 
-exec $($cc -print-prog-name=ld) -nostdlib "$@" -lc -dynamic-linker "$ldso"
+$($cc -print-prog-name=ld.lld) -nostdlib "$@" -lc -dynamic-linker "$ldso"

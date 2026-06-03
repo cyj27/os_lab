@@ -1,51 +1,23 @@
-#include <sys/shm.h>
-#include <endian.h>
-#include "syscall.h"
-#include "ipc.h"
+/*
+ * Copyright (c) 2023 Institute of Parallel And Distributed Systems (IPADS), Shanghai Jiao Tong University (SJTU)
+ * Licensed under the Mulan PSL v2.
+ * You can use this software according to the terms and conditions of the Mulan PSL v2.
+ * You may obtain a copy of Mulan PSL v2 at:
+ *     http://license.coscl.org.cn/MulanPSL2
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY OR FIT FOR A PARTICULAR
+ * PURPOSE.
+ * See the Mulan PSL v2 for more details.
+ */
 
-#if __BYTE_ORDER != __BIG_ENDIAN
-#undef SYSCALL_IPC_BROKEN_MODE
-#endif
+#include <sys/shm.h>
+#include "syscall.h"
 
 int shmctl(int id, int cmd, struct shmid_ds *buf)
 {
-#if IPC_TIME64
-	struct shmid_ds out, *orig;
-	if (cmd&IPC_TIME64) {
-		out = (struct shmid_ds){0};
-		orig = buf;
-		buf = &out;
-	}
-#endif
-#ifdef SYSCALL_IPC_BROKEN_MODE
-	struct shmid_ds tmp;
-	if (cmd == IPC_SET) {
-		tmp = *buf;
-		tmp.shm_perm.mode *= 0x10000U;
-		buf = &tmp;
-	}
-#endif
-#ifndef SYS_ipc
-	int r = __syscall(SYS_shmctl, id, IPC_CMD(cmd), buf);
+#ifdef CHCORE_SERVER_POSIX_SHM
+	return syscall(SYS_shmctl, id, cmd, buf);
 #else
-	int r = __syscall(SYS_ipc, IPCOP_shmctl, id, IPC_CMD(cmd), 0, buf, 0);
+	return -1;
 #endif
-#ifdef SYSCALL_IPC_BROKEN_MODE
-	if (r >= 0) switch (cmd | IPC_TIME64) {
-	case IPC_STAT:
-	case SHM_STAT:
-	case SHM_STAT_ANY:
-		buf->shm_perm.mode >>= 16;
-	}
-#endif
-#if IPC_TIME64
-	if (r >= 0 && (cmd&IPC_TIME64)) {
-		buf = orig;
-		*buf = out;
-		IPC_HILO(buf, shm_atime);
-		IPC_HILO(buf, shm_dtime);
-		IPC_HILO(buf, shm_ctime);
-	}
-#endif
-	return __syscall_ret(r);
 }

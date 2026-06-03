@@ -1,3 +1,15 @@
+/*
+ * Copyright (c) 2023 Institute of Parallel And Distributed Systems (IPADS), Shanghai Jiao Tong University (SJTU)
+ * Licensed under the Mulan PSL v2.
+ * You can use this software according to the terms and conditions of the Mulan PSL v2.
+ * You may obtain a copy of Mulan PSL v2 at:
+ *     http://license.coscl.org.cn/MulanPSL2
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY OR FIT FOR A PARTICULAR
+ * PURPOSE.
+ * See the Mulan PSL v2 for more details.
+ */
+
 #define _GNU_SOURCE
 #define SYSCALL_NO_TLS 1
 #include <stdlib.h>
@@ -23,6 +35,11 @@
 #include "fork_impl.h"
 #include "libc.h"
 #include "dynlink.h"
+#include <chcore/defs.h>
+#include <chcore/syscall.h>
+#include <chcore/memory.h>
+
+#define CHCORE_GDB_AUTO_LOAD_LIB 0
 
 #define malloc __libc_malloc
 #define calloc __libc_calloc
@@ -423,8 +440,14 @@ static void do_relocs(struct dso *dso, size_t *rel, size_t rel_size, size_t stri
 			addend -= (size_t)reloc_addr;
 		case REL_SYMBOLIC:
 		case REL_GOT:
-		case REL_PLT:
 			*reloc_addr = sym_val + addend;
+			break;
+		case REL_PLT:
+#ifdef CHCORE_ARCH_SPARC
+			sparc_plt_fixup(reloc_addr, sym_val);
+#else
+			*reloc_addr = sym_val + addend;
+#endif
 			break;
 		case REL_USYMBOLIC:
 			memcpy(reloc_addr, &(size_t){sym_val + addend}, sizeof(size_t));
@@ -577,31 +600,9 @@ static ssize_t read_loop(int fd, void *p, size_t n)
 
 static void *mmap_fixed(void *p, size_t n, int prot, int flags, int fd, off_t off)
 {
-	static int no_map_fixed;
-	char *q;
-	if (!n) return p;
-	if (!no_map_fixed) {
-		q = mmap(p, n, prot, flags|MAP_FIXED, fd, off);
-		if (!DL_NOMMU_SUPPORT || q != MAP_FAILED || errno != EINVAL)
-			return q;
-		no_map_fixed = 1;
-	}
-	/* Fallbacks for MAP_FIXED failure on NOMMU kernels. */
-	if (flags & MAP_ANONYMOUS) {
-		memset(p, 0, n);
-		return p;
-	}
-	ssize_t r;
-	if (lseek(fd, off, SEEK_SET) < 0) return MAP_FAILED;
-	for (q=p; n; q+=r, off+=r, n-=r) {
-		r = read(fd, q, n);
-		if (r < 0 && errno != EINTR) return MAP_FAILED;
-		if (!r) {
-			memset(q, 0, n);
-			break;
-		}
-	}
-	return p;
+	flags &= (~MAP_FIXED);
+	flags |= MAP_FIXED_NOREPLACE;
+	return mmap(p, n, prot, flags, fd, off);
 }
 
 static void unmap_library(struct dso *dso)
@@ -639,9 +640,12 @@ static void *map_library(int fd, struct dso *dso)
 
 	ssize_t l = read(fd, buf, sizeof buf);
 	eh = buf;
+
 	if (l<0) return 0;
+
 	if (l<sizeof *eh || (eh->e_type != ET_DYN && eh->e_type != ET_EXEC))
 		goto noexec;
+
 	phsize = eh->e_phentsize * eh->e_phnum;
 	if (phsize > sizeof buf - sizeof *eh) {
 		allocated_buf = malloc(phsize);
@@ -658,6 +662,7 @@ static void *map_library(int fd, struct dso *dso)
 	} else {
 		ph = ph0 = (void *)((char *)buf + eh->e_phoff);
 	}
+
 	for (i=eh->e_phnum; i; i--, ph=(void *)((char *)ph+eh->e_phentsize)) {
 		if (ph->p_type == PT_DYNAMIC) {
 			dyn = ph->p_vaddr;
@@ -689,6 +694,7 @@ static void *map_library(int fd, struct dso *dso)
 			addr_max = ph->p_vaddr+ph->p_memsz;
 		}
 	}
+
 	if (!dyn) goto noexec;
 	if (DL_FDPIC && !(eh->e_flags & FDPIC_CONSTDISP_FLAG)) {
 		dso->loadmap = calloc(1, sizeof *dso->loadmap
@@ -730,20 +736,27 @@ static void *map_library(int fd, struct dso *dso)
 		map_len = 0;
 		goto done_mapping;
 	}
+
 	addr_max += PAGE_SIZE-1;
 	addr_max &= -PAGE_SIZE;
 	addr_min &= -PAGE_SIZE;
 	off_start &= -PAGE_SIZE;
 	map_len = addr_max - addr_min + off_start;
+
+
 	/* The first time, we map too much, possibly even more than
 	 * the length of the file. This is okay because we will not
 	 * use the invalid part; we just need to reserve the right
 	 * amount of virtual address space to map over later. */
+
 	map = DL_NOMMU_SUPPORT
 		? mmap((void *)addr_min, map_len, PROT_READ|PROT_WRITE|PROT_EXEC,
 			MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
-		: mmap((void *)addr_min, map_len, prot,
-			MAP_PRIVATE, fd, off_start);
+		: (void *)chcore_alloc_vaddr(map_len);
+	// chcore_alloc_vaddr would return NULL if alloc failed, but MAP_FAILED
+	// (-1) is used to indicate error here.
+	map = map == NULL ? MAP_FAILED : map;
+
 	if (map==MAP_FAILED) goto error;
 	dso->map = map;
 	dso->map_len = map_len;
@@ -753,6 +766,8 @@ static void *map_library(int fd, struct dso *dso)
 		errno = EBUSY;
 		goto error;
 	}
+
+
 	base = map - addr_min;
 	dso->phdr = 0;
 	dso->phnum = 0;
@@ -767,24 +782,33 @@ static void *map_library(int fd, struct dso *dso)
 			dso->phnum = eh->e_phnum;
 			dso->phentsize = eh->e_phentsize;
 		}
+		/* addresses declared in file (FileAddr) */
+		/* memory mapped address (MapAddr) = base+FileAddr */
 		this_min = ph->p_vaddr & -PAGE_SIZE;
 		this_max = ph->p_vaddr+ph->p_memsz+PAGE_SIZE-1 & -PAGE_SIZE;
+		size_t brk = (size_t)ph->p_vaddr+ph->p_filesz;
+		size_t pgbrk = brk+PAGE_SIZE-1 & -PAGE_SIZE;
 		off_start = ph->p_offset & -PAGE_SIZE;
 		prot = (((ph->p_flags&PF_R) ? PROT_READ : 0) |
 			((ph->p_flags&PF_W) ? PROT_WRITE: 0) |
 			((ph->p_flags&PF_X) ? PROT_EXEC : 0));
 		/* Reuse the existing mapping for the lowest-address LOAD */
-		if ((ph->p_vaddr & -PAGE_SIZE) != addr_min || DL_NOMMU_SUPPORT)
-			if (mmap_fixed(base+this_min, this_max-this_min, prot, MAP_PRIVATE|MAP_FIXED, fd, off_start) == MAP_FAILED)
-				goto error;
+
+		/* p: MapAddr, n: FileAddr-FileAddr */
+		if (ph->p_filesz != 0 && mmap_fixed(base+this_min, pgbrk-this_min, prot, MAP_PRIVATE|MAP_FIXED, fd, off_start) == MAP_FAILED) {
+			goto error;
+		}
+
 		if (ph->p_memsz > ph->p_filesz && (ph->p_flags&PF_W)) {
-			size_t brk = (size_t)base+ph->p_vaddr+ph->p_filesz;
-			size_t pgbrk = brk+PAGE_SIZE-1 & -PAGE_SIZE;
-			memset((void *)brk, 0, pgbrk-brk & PAGE_SIZE-1);
-			if (pgbrk-(size_t)base < this_max && mmap_fixed((void *)pgbrk, (size_t)base+this_max-pgbrk, prot, MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS, -1, 0) == MAP_FAILED)
+			/* dst: MapAddr, size: FileAddr-FileAddr */
+			memset(base+brk, 0, pgbrk-brk & PAGE_SIZE-1);
+			/* FileAddr < FileAddr & p: MapAddr, n: FileAddr-FileAddr */
+			if (pgbrk < this_max && mmap_fixed(base+pgbrk, (size_t)this_max-pgbrk, prot, MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS, -1, 0) == MAP_FAILED) {
 				goto error;
+			}
 		}
 	}
+
 	for (i=0; ((size_t *)(base+dyn))[i]; i+=2)
 		if (((size_t *)(base+dyn))[i]==DT_TEXTREL) {
 			if (mprotect(map, map_len, PROT_READ|PROT_WRITE|PROT_EXEC)
@@ -793,9 +817,17 @@ static void *map_library(int fd, struct dso *dso)
 			break;
 		}
 done_mapping:
+
 	dso->base = base;
 	dso->dynv = laddr(dso, dyn);
-	if (dso->tls.size) dso->tls.image = laddr(dso, tls_image);
+
+	if (dso->tls.size) {
+		dso->tls.image = laddr(dso, tls_image);
+	}
+#if CHCORE_GDB_AUTO_LOAD_LIB
+	printf("map library base:0x%lx\n", base);
+#endif
+
 	free(allocated_buf);
 	return map;
 noexec:
@@ -1031,6 +1063,7 @@ static struct dso *load_library(const char *name, struct dso *needed_by)
 			is_self = 1;
 		}
 	}
+
 	if (!strcmp(name, ldso.name)) is_self = 1;
 	if (is_self) {
 		if (!ldso.prev) {
@@ -1100,6 +1133,7 @@ static struct dso *load_library(const char *name, struct dso *needed_by)
 		}
 		pathname = buf;
 	}
+
 	if (fd < 0) return 0;
 	if (fstat(fd, &st) < 0) {
 		close(fd);
@@ -1116,6 +1150,9 @@ static struct dso *load_library(const char *name, struct dso *needed_by)
 			return p;
 		}
 	}
+#if CHCORE_GDB_AUTO_LOAD_LIB
+	printf("load library name:%s\n", name);
+#endif
 	map = noload ? 0 : map_library(fd, &temp_dso);
 	close(fd);
 	if (!map) return 0;
@@ -1231,11 +1268,26 @@ static void load_direct_deps(struct dso *p)
 	p->ndeps_direct = cnt;
 }
 
+/*
+ * This function is set as the breakpoint to indicate that all libs are loaded.
+ * Then GDB starts loading symbols of these libs.
+ */
+#if CHCORE_GDB_AUTO_LOAD_LIB
+__attribute__((noinline))
+void gdb_loadefl_break()
+{
+	printf("load library complete\n");
+}
+#endif
+
 static void load_deps(struct dso *p)
 {
 	if (p->deps) return;
 	for (; p; p=p->next)
 		load_direct_deps(p);
+#if CHCORE_GDB_AUTO_LOAD_LIB
+	gdb_loadefl_break();
+#endif
 }
 
 static void extend_bfs_deps(struct dso *p)
@@ -1264,7 +1316,7 @@ static void extend_bfs_deps(struct dso *p)
 		struct dso *dep = p->deps[i];
 		for (j=cnt=0; j<dep->ndeps_direct; j++)
 			if (!dep->deps[j]->mark) cnt++;
-		tmp = no_realloc ? 
+		tmp = no_realloc ?
 			malloc(sizeof(*tmp) * (ndeps_all+cnt+1)) :
 			realloc(p->deps, sizeof(*tmp) * (ndeps_all+cnt+1));
 		if (!tmp) {
@@ -1411,6 +1463,7 @@ void __libc_exit_fini()
 	pthread_mutex_lock(&init_fini_lock);
 	shutting_down = 1;
 	pthread_rwlock_unlock(&lock);
+
 	for (p=fini_head; p; p=p->fini_next) {
 		while (p->ctor_visitor && p->ctor_visitor!=self)
 			pthread_cond_wait(&ctor_cond, &init_fini_lock);
@@ -1426,6 +1479,7 @@ void __libc_exit_fini()
 			fpaddr(p, dyn[DT_FINI])();
 #endif
 	}
+
 }
 
 void __ldso_atfork(int who)
@@ -1521,7 +1575,7 @@ static void do_init_fini(struct dso **queue)
 		if (p->ctor_visitor || p->constructed)
 			continue;
 		p->ctor_visitor = self;
-		
+
 		decode_vec(p->dynv, dyn, DYN_CNT);
 		if (dyn[0] & ((1<<DT_FINI) | (1<<DT_FINI_ARRAY))) {
 			p->fini_next = fini_head;
@@ -1632,7 +1686,7 @@ static void install_new_tls(void)
  * following stage 2 and stage 3 functions via primitive symbolic lookup
  * since it does not have access to their addresses to begin with. */
 
-/* Stage 2 of the dynamic linker is called after relative relocations 
+/* Stage 2 of the dynamic linker is called after relative relocations
  * have been processed. It can make function calls to static functions
  * and access string literals and static data, but cannot use extern
  * symbols. Its job is to perform symbolic relocations on the dynamic
@@ -1659,6 +1713,7 @@ hidden void __dls2(unsigned char *base, size_t *sp)
 	} else {
 		ldso.base = base;
 	}
+
 	Ehdr *ehdr = (void *)ldso.base;
 	ldso.name = ldso.shortname = "libc.so";
 	ldso.phnum = ehdr->e_phnum;
@@ -1706,6 +1761,8 @@ hidden void __dls2(unsigned char *base, size_t *sp)
 
 void __dls2b(size_t *sp, size_t *auxv)
 {
+
+
 	/* Setup early thread pointer in builtin_tls for ldso/libc itself to
 	 * use during dynamic linking. If possible it will also serve as the
 	 * thread pointer at runtime. */
@@ -1750,11 +1807,18 @@ void __dls3(size_t *sp, size_t *auxv)
 	libc.secure = ((aux[0]&0x7800)!=0x7800 || aux[AT_UID]!=aux[AT_EUID]
 		|| aux[AT_GID]!=aux[AT_EGID] || aux[AT_SECURE]);
 
+
+	extern void __libc_chcore_init(void);
+	__libc_chcore_init();
+
 	/* Only trust user/env if kernel says we're not suid/sgid */
 	if (!libc.secure) {
 		env_path = getenv("LD_LIBRARY_PATH");
+
+
 		env_preload = getenv("LD_PRELOAD");
 	}
+
 
 	/* If the main program was already loaded by the kernel,
 	 * AT_PHDR will point to some location other than the dynamic
@@ -1778,6 +1842,9 @@ void __dls3(size_t *sp, size_t *auxv)
 				app.tls.align = phdr->p_align;
 			}
 		}
+
+
+
 		if (DL_FDPIC) app.loadmap = app_loadmap;
 		if (app.tls.size) app.tls.image = laddr(&app, tls_image);
 		if (interp_off) ldso.name = laddr(&app, interp_off);
@@ -1831,12 +1898,16 @@ void __dls3(size_t *sp, size_t *auxv)
 			dprintf(2, "%s: cannot load %s: %s\n", ldname, argv[0], strerror(errno));
 			_exit(1);
 		}
+#if CHCORE_GDB_AUTO_LOAD_LIB
+		printf("load library name:%s\n", argv[0]);
+#endif
 		Ehdr *ehdr = map_library(fd, &app);
 		if (!ehdr) {
 			dprintf(2, "%s: %s: Not a valid dynamic program\n", ldname, argv[0]);
 			_exit(1);
 		}
 		close(fd);
+
 		ldso.name = ldname;
 		app.name = argv[0];
 		aux[AT_ENTRY] = (size_t)laddr(&app, ehdr->e_entry);
@@ -1850,7 +1921,10 @@ void __dls3(size_t *sp, size_t *auxv)
 			dprintf(1, "\t%s (%p)\n", ldso.name, ldso.base);
 		}
 	}
+
+
 	if (app.tls.size) {
+
 		libc.tls_head = tls_tail = &app.tls;
 		app.tls_id = tls_cnt = 1;
 #ifdef TLS_ABOVE_TP
@@ -1879,6 +1953,7 @@ void __dls3(size_t *sp, size_t *auxv)
 		argv[-3] = (void *)app.loadmap;
 	}
 
+
 	/* Initial dso chain consists only of the app. */
 	head = tail = syms_tail = &app;
 
@@ -1886,16 +1961,22 @@ void __dls3(size_t *sp, size_t *auxv)
 	reclaim_gaps(&app);
 	reclaim_gaps(&ldso);
 
+
 	/* Load preload/needed libraries, add symbols to global namespace. */
 	ldso.deps = (struct dso **)no_deps;
 	if (env_preload) load_preload(env_preload);
- 	load_deps(&app);
+
+
+	load_deps(&app);
 	for (struct dso *p=head; p; p=p->next)
 		add_syms(p);
+
 
 	/* Attach to vdso, if provided by the kernel, last so that it does
 	 * not become part of the global namespace.  */
 	if (search_vec(auxv, &vdso_base, AT_SYSINFO_EHDR) && vdso_base) {
+
+
 		Ehdr *ehdr = (void *)vdso_base;
 		Phdr *phdr = vdso.phdr = (void *)(vdso_base + ehdr->e_phoff);
 		vdso.phnum = ehdr->e_phnum;
@@ -1916,6 +1997,7 @@ void __dls3(size_t *sp, size_t *auxv)
 		tail = &vdso;
 	}
 
+
 	for (i=0; app.dynv[i]; i+=2) {
 		if (!DT_DEBUG_INDIRECT && app.dynv[i]==DT_DEBUG)
 			app.dynv[i+1] = (size_t)&debug;
@@ -1924,6 +2006,7 @@ void __dls3(size_t *sp, size_t *auxv)
 			*ptr = (size_t)&debug;
 		}
 	}
+
 
 	/* This must be done before final relocations, since it calls
 	 * malloc, which may be provided by the application. Calling any
@@ -1947,18 +2030,40 @@ void __dls3(size_t *sp, size_t *auxv)
 	}
 	static_tls_cnt = tls_cnt;
 
+
 	/* The main program must be relocated LAST since it may contain
 	 * copy relocations which depend on libraries' relocations. */
 	reloc_all(app.next);
+
 	reloc_all(&app);
 
 	/* Actual copying to new TLS needs to happen after relocations,
 	 * since the TLS images might have contained relocated addresses. */
 	if (initial_tls != builtin_tls) {
+
+		/* Path-1: the application main thread will use a new TLS.
+		 * So, we pass the system IPC structs of LD to it.
+		 * If we add more IPC structs in future, we also need to pass them here.
+		 */
+		ipc_struct_t *system_ipc_fsm = fsm_ipc_struct;
+		ipc_struct_t *system_ipc_net = lwip_ipc_struct;
+		ipc_struct_t *system_ipc_procmgr = procmgr_ipc_struct;
+
 		if (__init_tp(__copy_tls(initial_tls)) < 0) {
 			a_crash();
 		}
+
+		memcpy(fsm_ipc_struct, system_ipc_fsm, sizeof(ipc_struct_t));
+		memcpy(lwip_ipc_struct, system_ipc_net, sizeof(ipc_struct_t));
+		memcpy(procmgr_ipc_struct, system_ipc_procmgr, sizeof(ipc_struct_t));
+
 	} else {
+
+		/*
+		 * Path-2: the application main thread will inherit the TLS from LD.
+		 * So, we do not need to pass IPC structs.
+		 */
+
 		size_t tmp_tls_size = libc.tls_size;
 		pthread_t self = __pthread_self();
 		/* Temporarily set the tls size to the full size of
@@ -1969,8 +2074,13 @@ void __dls3(size_t *sp, size_t *auxv)
 		libc.tls_size = tmp_tls_size;
 	}
 
-	if (ldso_fail) _exit(127);
-	if (ldd_mode) _exit(0);
+	if (ldso_fail) {
+		_exit(127);
+	}
+	if (ldd_mode) {
+		_exit(0);
+	}
+
 
 	/* Determine if malloc was interposed by a replacement implementation
 	 * so that calloc and the memalign family can harden against the
@@ -1979,6 +2089,7 @@ void __dls3(size_t *sp, size_t *auxv)
 		__malloc_replaced = 1;
 	if (find_sym(head, "aligned_alloc", 1).dso != &ldso)
 		__aligned_alloc_replaced = 1;
+
 
 	/* Switch to runtime mode: any further failures in the dynamic
 	 * linker are a reportable failure rather than a fatal startup
@@ -1995,6 +2106,25 @@ void __dls3(size_t *sp, size_t *auxv)
 	if (replace_argv0) argv[0] = replace_argv0;
 
 	errno = 0;
+
+#ifdef CHCORE_OPENTRUSTEE
+	/*
+	 * Because CRT is not linked in opentrustee framework, we directly jump
+	 * into __libc_start_main instead of AT_ENTRY.
+	 */
+	extern int __libc_start_main(int (*main)(int,char **,char **), int argc, char **argv);
+	if (!strcmp("/gtask.elf", *argv)
+		|| !strcmp("/teesmcmgr.elf", *argv)
+		|| !strcmp("/tarunner.elf", *argv)) {
+		__asm__ __volatile__(
+			"mov x0, %0; mov x1, %1; mov x2, %2"
+			:
+			: "r"(aux[AT_ENTRY]), "r"(*(long *)(argv-1)), "r"(argv)
+			: "x0", "x1", "x2"
+		);
+		CRTJMP(__libc_start_main, argv-1);
+	}
+#endif /* CHCORE_OPENTRUSTEE */
 
 	CRTJMP((void *)aux[AT_ENTRY], argv-1);
 	for(;;);
@@ -2022,6 +2152,18 @@ static void prepare_lazy(struct dso *p)
 	lazy_head = p;
 }
 
+#ifdef CHCORE_OHTEE
+int end_with_so(const char *str) {
+    size_t len = strlen(str);
+
+    if (len < 3) {
+        return 0;
+    }
+
+    return (strcmp(str + len - 3, ".so") == 0);
+}
+#endif
+
 void *dlopen(const char *file, int mode)
 {
 	struct dso *volatile p, *orig_tail, *orig_syms_tail, *orig_lazy_head, *next;
@@ -2033,6 +2175,10 @@ void *dlopen(const char *file, int mode)
 	struct dso **volatile ctor_queue = 0;
 
 	if (!file) return head;
+
+#ifdef CHCORE_OHTEE
+	if (!end_with_so(file)) return head;
+#endif
 
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cs);
 	pthread_rwlock_wrlock(&lock);
@@ -2054,6 +2200,7 @@ void *dlopen(const char *file, int mode)
 	orig_syms_tail = syms_tail;
 	orig_tail = tail;
 	noload = mode & RTLD_NOLOAD;
+
 
 	rtld_fail = &jb;
 	if (setjmp(*rtld_fail)) {
@@ -2095,6 +2242,7 @@ void *dlopen(const char *file, int mode)
 			file);
 		goto end;
 	}
+
 
 	/* First load handling */
 	load_deps(p);

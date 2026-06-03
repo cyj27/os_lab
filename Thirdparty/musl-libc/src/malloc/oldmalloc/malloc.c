@@ -1,3 +1,15 @@
+/*
+ * Copyright (c) 2023 Institute of Parallel And Distributed Systems (IPADS), Shanghai Jiao Tong University (SJTU)
+ * Licensed under the Mulan PSL v2.
+ * You can use this software according to the terms and conditions of the Mulan PSL v2.
+ * You may obtain a copy of Mulan PSL v2 at:
+ *     http://license.coscl.org.cn/MulanPSL2
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY OR FIT FOR A PARTICULAR
+ * PURPOSE.
+ * See the Mulan PSL v2 for more details.
+ */
+
 #define _GNU_SOURCE
 #include <stdlib.h>
 #include <string.h>
@@ -7,7 +19,8 @@
 #include <sys/mman.h>
 #include "libc.h"
 #include "atomic.h"
-#include "pthread_impl.h"
+//#include "pthread_impl.h"
+#include "syscall.h"
 #include "malloc_impl.h"
 #include "fork_impl.h"
 
@@ -27,21 +40,29 @@ static struct {
 
 /* Synchronization tools */
 
+#include <debug_lock.h>
+
 static inline void lock(volatile int *lk)
 {
+	chcore_spin_lock(lk);
+#if 0
 	int need_locks = libc.need_locks;
 	if (need_locks) {
 		while(a_swap(lk, 1)) __wait(lk, lk+1, 1, 1);
 		if (need_locks < 0) libc.need_locks = 0;
 	}
+#endif
 }
 
 static inline void unlock(volatile int *lk)
 {
+	chcore_spin_unlock(lk);
+#if 0
 	if (lk[0]) {
 		a_store(lk, 0);
 		if (lk[1]) __wake(lk, 1, 1);
 	}
+#endif
 }
 
 static inline void lock_bin(int i)
@@ -478,18 +499,19 @@ void __bin_chunk(struct chunk *self)
 	unlock(mal.split_merge_lock);
 
 	/* Replace middle of large chunks with fresh zero pages */
-	if (size > RECLAIM && (size^(size-osize)) > size-osize) {
-		uintptr_t a = (uintptr_t)self + SIZE_ALIGN+PAGE_SIZE-1 & -PAGE_SIZE;
-		uintptr_t b = (uintptr_t)next - SIZE_ALIGN & -PAGE_SIZE;
-		int e = errno;
+        // Note: ChCore did not implement madvise()
+	// if (size > RECLAIM && (size^(size-osize)) > size-osize) {
+	// 	uintptr_t a = (uintptr_t)self + SIZE_ALIGN+PAGE_SIZE-1 & -PAGE_SIZE;
+	// 	uintptr_t b = (uintptr_t)next - SIZE_ALIGN & -PAGE_SIZE;
+	// 	int e = errno;
 #if 1
-		__madvise((void *)a, b-a, MADV_DONTNEED);
+	// 	__madvise((void *)a, b-a, MADV_DONTNEED);
 #else
-		__mmap((void *)a, b-a, PROT_READ|PROT_WRITE,
-			MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0);
+	// 	__mmap((void *)a, b-a, PROT_READ|PROT_WRITE,
+	// 		MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0);
 #endif
-		errno = e;
-	}
+	// 	errno = e;
+	// }
 
 	unlock_bin(i);
 }

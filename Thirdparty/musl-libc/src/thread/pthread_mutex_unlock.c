@@ -1,4 +1,5 @@
 #include "pthread_impl.h"
+#include <chcore/syscall.h>
 
 int __pthread_mutex_unlock(pthread_mutex_t *m)
 {
@@ -9,6 +10,9 @@ int __pthread_mutex_unlock(pthread_mutex_t *m)
 	int priv = (m->_m_type & 128) ^ 128;
 	int new = 0;
 	int old;
+	int old_prio;
+
+	old_prio = m->old_prio;
 
 	if (type != PTHREAD_MUTEX_NORMAL) {
 		self = __pthread_self();
@@ -46,6 +50,10 @@ int __pthread_mutex_unlock(pthread_mutex_t *m)
 	}
 	if (waiters || cont<0)
 		__wake(&m->_m_lock, 1, priv);
+
+	if (old_prio)
+		usys_set_prio(0, old_prio);
+
 	return 0;
 }
 

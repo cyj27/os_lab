@@ -1,4 +1,13 @@
 #!/bin/sh
+# Copyright (c) 2023 Institute of Parallel And Distributed Systems (IPADS), Shanghai Jiao Tong University (SJTU)
+# Licensed under the Mulan PSL v2.
+# You can use this software according to the terms and conditions of the Mulan PSL v2.
+# You may obtain a copy of Mulan PSL v2 at:
+#     http://license.coscl.org.cn/MulanPSL2
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY OR FIT FOR A PARTICULAR
+# PURPOSE.
+# See the Mulan PSL v2 for more details.
 
 usage () {
 cat <<EOF
@@ -43,6 +52,9 @@ Some influential environment variables:
   CFLAGS                  C compiler flags [-Os -pipe ...]
   CROSS_COMPILE           prefix for cross compiler and tools [none]
   LIBCC                   compiler runtime library [detected]
+  LIBCHCORE_A             path to libchcore-abi.a
+  LIBCHCORE_INCLUDE       path to the include directory of libchcore-abi
+  UAPI_INCLUDE            path to the uapi include directory
 
 Use these variables to override the choices made by configure.
 
@@ -181,9 +193,14 @@ AR=*) AR=${arg#*=} ;;
 RANLIB=*) RANLIB=${arg#*=} ;;
 CC=*) CC=${arg#*=} ;;
 CFLAGS=*) CFLAGS=${arg#*=} ;;
+LIBCHCORE_A=*) LIBCHCORE_A=${arg#*=} ;;
+LIBCHCORE_INCLUDE=*) LIBCHCORE_INCLUDE=${arg#*=} ;;
+UAPI_INCLUDE=*) UAPI_INCLUDE=${arg#*=} ;;
 CPPFLAGS=*) CPPFLAGS=${arg#*=} ;;
 LDFLAGS=*) LDFLAGS=${arg#*=} ;;
 CROSS_COMPILE=*) CROSS_COMPILE=${arg#*=} ;;
+COMPILER_DIR=*) COMPILER_DIR=${arg#*=} ;;
+COMPILER=*) COMPILER=${arg#*=} ;;
 LIBCC=*) LIBCC=${arg#*=} ;;
 *=*) ;;
 *) build=$arg ; target=$arg ;;
@@ -238,9 +255,7 @@ CROSS_COMPILE="$target-"
 # Find a C compiler to use
 #
 printf "checking for C compiler... "
-trycc ${CROSS_COMPILE}gcc
-trycc ${CROSS_COMPILE}c99
-trycc ${CROSS_COMPILE}cc
+trycc ${COMPILER}
 printf "%s\n" "$CC"
 test -n "$CC" || { echo "$0: cannot find a C compiler" ; exit 1 ; }
 
@@ -308,6 +323,7 @@ fi
 if test "$clang_wrapper" = yes ; then
 tools="$tools obj/musl-clang obj/ld.musl-clang"
 fi
+tools="$tools obj/musl-ar obj/musl-strip"
 
 #
 # Find the target architecture
@@ -338,6 +354,7 @@ powerpc*|ppc*) ARCH=powerpc ;;
 riscv64*) ARCH=riscv64 ;;
 sh[1-9bel-]*|sh|superh*) ARCH=sh ;;
 s390x*) ARCH=s390x ;;
+sparc*) ARCH=sparc ;;
 unknown) fail "$0: unable to detect target arch; try $0 --target=..." ;;
 *) fail "$0: unknown or unsupported target \"$target\"" ;;
 esac
@@ -592,6 +609,11 @@ tryldflag LDFLAGS_AUTO -Wl,--exclude-libs=ALL
 tryldflag LDFLAGS_AUTO -Wl,--dynamic-list="$srcdir/dynamic.list"
 
 # Find compiler runtime library
+case "$COMPILER" in
+*clang*)
+        LIBCC="-lclang_rt.builtins"
+        ;;
+esac
 test -z "$LIBCC" && tryldflag LIBCC -lgcc && tryldflag LIBCC -lgcc_eh
 test -z "$LIBCC" && tryldflag LIBCC -lcompiler_rt
 test -z "$LIBCC" && try_libcc=`$CC -print-libgcc-file-name 2>/dev/null` \
@@ -790,15 +812,20 @@ CFLAGS_C99FSE = $CFLAGS_C99FSE
 CFLAGS_MEMOPS = $CFLAGS_MEMOPS
 CFLAGS_NOSSP = $CFLAGS_NOSSP
 CPPFLAGS = $CPPFLAGS
+LIBCHCORE_A = $LIBCHCORE_A
+LIBCHCORE_INCLUDE = $LIBCHCORE_INCLUDE
+UAPI_INCLUDE = $UAPI_INCLUDE
 LDFLAGS = $LDFLAGS
 LDFLAGS_AUTO = $LDFLAGS_AUTO
 CROSS_COMPILE = $CROSS_COMPILE
+COMPILER_DIR = $COMPILER_DIR
 LIBCC = $LIBCC
 OPTIMIZE_GLOBS = $OPTIMIZE_GLOBS
 ALL_TOOLS = $tools
 TOOL_LIBS = $tool_libs
 ADD_CFI = $ADD_CFI
 MALLOC_DIR = $malloc_dir
+TARGET = $target
 EOF
 test "x$static" = xno && echo "STATIC_LIBS ="
 test "x$shared" = xno && echo "SHARED_LIBS ="
@@ -807,6 +834,6 @@ test "x$cc_family" = xclang && echo 'WRAPCC_CLANG = $(CC)'
 test "x$pic_default" = xyes && echo 'AOBJS = $(LOBJS)'
 exec 1>&3 3>&-
 
-test "$srcdir" = "." || ln -sf $srcdir/Makefile .
+test "$srcdir" = "." || cp -r $srcdir/Makefile .
 
 printf "done\n"

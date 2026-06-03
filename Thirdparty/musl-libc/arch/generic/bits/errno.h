@@ -1,3 +1,15 @@
+/*
+ * Copyright (c) 2023 Institute of Parallel And Distributed Systems (IPADS), Shanghai Jiao Tong University (SJTU)
+ * Licensed under the Mulan PSL v2.
+ * You can use this software according to the terms and conditions of the Mulan PSL v2.
+ * You may obtain a copy of Mulan PSL v2 at:
+ *     http://license.coscl.org.cn/MulanPSL2
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY OR FIT FOR A PARTICULAR
+ * PURPOSE.
+ * See the Mulan PSL v2 for more details.
+ */
+
 #define EPERM            1
 #define ENOENT           2
 #define ESRCH            3
@@ -132,3 +144,13 @@
 #define ENOTRECOVERABLE 131
 #define ERFKILL         132
 #define EHWPOISON       133
+
+/* ChCore Specific */
+#define EIPCRETRY       199     /* Retry the IPC call */
+#define ECAPBILITY      200     /* Invalid capability */
+#define ESUPPORT        201     /* Not supported */
+#define EBADSYSCALL     202     /* Bad syscall number */
+#define ENOMAPPING      203     /* No memory mapping in pgtbl */
+#define ESIGBUS         204     /* Bus error */
+
+#define EMAX            205
