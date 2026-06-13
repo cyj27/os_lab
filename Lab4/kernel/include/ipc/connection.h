@@ -150,6 +150,9 @@ struct ipc_connection {
         cap_t conn_cap_in_client;
         cap_t conn_cap_in_server;
         int state;
+        bool fast_cap_meta;
+        unsigned int server_cap_buf_num;
+        unsigned int client_cap_buf_num;
         struct ipc_send_cap_struct server_cap_buf[MAX_CAP_TRANSFER];
         struct ipc_send_cap_struct client_cap_buf[MAX_CAP_TRANSFER];
 };

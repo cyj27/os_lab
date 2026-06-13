@@ -87,6 +87,9 @@ typedef struct ipc_msg ipc_msg_t;
 void __ipc_server_init_raw_msg(ipc_msg_t *ipc_msg, void *shm_ptr, unsigned int max_data_len, unsigned int cap_num);
 
 #define IPC_SHM_AVAILABLE (IPC_PER_SHM_SIZE - sizeof(struct ipc_response_hdr))
+#define IPC_FAST_CAP_META_OFFSET (IPC_PER_SHM_SIZE - sizeof(struct ipc_cap_transfer_meta))
+#define IPC_FAST_MSG_BUF_OFFSET  (IPC_FAST_CAP_META_OFFSET - IPC_FAST_MSG_BUF_SIZE)
+#define IPC_FAST_SHM_AVAILABLE   (IPC_FAST_MSG_BUF_OFFSET - sizeof(struct ipc_response_hdr))
 
 #ifndef CHCORE_OPENTRUSTEE
 #ifdef CHCORE_ARCH_X86_64

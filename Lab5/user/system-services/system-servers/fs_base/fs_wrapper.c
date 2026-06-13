@@ -11,6 +11,7 @@
  */
 
 #include "chcore-internal/procmgr_defs.h"
+#include "chcore/container/list.h"
 #include "chcore/ipc.h"
 #include <errno.h>
 #include <pthread.h>
@@ -113,6 +114,21 @@ void init_fs_wrapper(void)
 int fs_wrapper_get_server_entry(badge_t client_badge, int fd)
 {
         /* Lab 5 TODO Begin (Part 3)*/
+        struct server_entry_node *elem;
+        if (fd == AT_FDROOT) {
+                return AT_FDROOT;
+        }
+        if (fd < 0 || fd >= MAX_SERVER_ENTRY_PER_CLIENT) {
+                return -1;
+        }
+        pthread_spin_lock(&server_entry_mapping_lock);
+        for_each_in_list(elem, struct server_entry_node, node, &server_entry_mapping) {
+                if (elem->client_badge == client_badge && elem->fd_to_fid[fd] != -1) {
+                        pthread_spin_unlock(&server_entry_mapping_lock);
+                        return elem->fd_to_fid[fd];
+                }
+        }
+        pthread_spin_unlock(&server_entry_mapping_lock);
         return -1;
         /* Lab 5 TODO End (Part 3)*/
 }
@@ -121,6 +137,33 @@ int fs_wrapper_get_server_entry(badge_t client_badge, int fd)
 int fs_wrapper_set_server_entry(badge_t client_badge, int fd, int fid)
 {
         /* Lab 5 TODO Begin (Part 3)*/
+        struct server_entry_node *elem;
+        if (fd == AT_FDROOT) {
+                return -1;
+        }
+        if (fd < 0 || fd >= MAX_SERVER_ENTRY_PER_CLIENT) {
+                return -1;
+        }
+        pthread_spin_lock(&server_entry_mapping_lock);
+        for_each_in_list(elem, struct server_entry_node, node, &server_entry_mapping) {
+                if (elem->client_badge == client_badge) {
+                        elem->fd_to_fid[fd] = fid;
+                        pthread_spin_unlock(&server_entry_mapping_lock);
+                        return 0;
+                }
+        }
+        elem = malloc(sizeof(*elem));
+        if (elem == NULL) {
+                pthread_spin_unlock(&server_entry_mapping_lock);
+                return -ENOMEM;
+        }
+        elem->client_badge = client_badge;
+        for (int i = 0; i < MAX_SERVER_ENTRY_PER_CLIENT; i++) {
+                elem->fd_to_fid[i] = -1;
+        }
+        elem->fd_to_fid[fd] = fid;
+        list_append(&elem->node, &server_entry_mapping);
+        pthread_spin_unlock(&server_entry_mapping_lock);
         return 0;
         /* Lab 5 TODO End (Part 3)*/
 }

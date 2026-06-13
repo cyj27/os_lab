@@ -42,6 +42,33 @@ struct ipc_response_hdr {
 
 #define SHM_PTR_TO_CUSTOM_DATA_PTR(shm_ptr) ((void *)((char *)(shm_ptr) + sizeof(struct ipc_response_hdr)))
 
+#define IPC_FAST_CAP_MAGIC       (0x4348504350415043UL)
+#define IPC_FAST_CAP_MAGIC_INV   (~IPC_FAST_CAP_MAGIC)
+#define IPC_FAST_CAP_VERSION     (1U)
+#define IPC_FAST_CAP_MAX_TRANSFER 16U
+#define IPC_FAST_MSG_BUF_SIZE    64U
+
+struct ipc_cap_transfer_meta_header {
+    unsigned long magic;
+    unsigned long magic_inv;
+    unsigned int version;
+    unsigned int call_cap_num;
+    unsigned int return_cap_num;
+} __attribute__((aligned(8)));
+
+struct ipc_cap_transfer_entry {
+    unsigned int valid;
+    cap_t cap;
+    cap_right_t mask;
+    cap_right_t rest;
+} __attribute__((aligned(8)));
+
+struct ipc_cap_transfer_meta {
+    struct ipc_cap_transfer_meta_header hdr;
+    struct ipc_cap_transfer_entry call_caps[IPC_FAST_CAP_MAX_TRANSFER];
+    struct ipc_cap_transfer_entry return_caps[IPC_FAST_CAP_MAX_TRANSFER];
+} __attribute__((aligned(8)));
+
 /**
  * @brief This type specifies the function signature that an IPC server 
  * should follow to be properly called by the kernel.

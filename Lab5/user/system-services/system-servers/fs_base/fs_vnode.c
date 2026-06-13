@@ -10,6 +10,7 @@
  * See the Mulan PSL v2 for more details.
  */
 
+#include "chcore/container/rbtree.h"
 #include <chcore-internal/fs_debug.h>
 #include <chcore/syscall.h>
 #include <stdio.h>
@@ -94,8 +95,20 @@ struct fs_vnode *alloc_fs_vnode(ino_t id, enum fs_vnode_type type, off_t size,
                                 void *private)
 {
         /* Lab 5 TODO Begin (Part 2) */
-
-        return NULL;
+        struct fs_vnode *n = malloc(sizeof(*n));
+        if (n == NULL)
+                return NULL;
+        n->vnode_id = id;
+        n->type = type;
+        n->size = size;
+        n->private = private;
+        n->pmo_cap = -1;
+        n->refcnt = 1;
+        n->page_cache = NULL;
+        if (using_page_cache)
+                n->page_cache = new_page_cache_entity_of_inode(id, n);
+        pthread_rwlock_init(&n->rwlock, NULL);
+        return n;
 
         /* Lab 5 TODO End (Part 2) */
 }
@@ -118,6 +131,11 @@ struct fs_vnode *get_fs_vnode_by_id(ino_t vnode_id)
 {
         /* Lab 5 TODO Begin (Part 2) */
         /* Use the rb_xxx api */
+        struct rb_node *n;
+        n = rb_search(fs_vnode_list, &vnode_id, comp_vnode_key);
+        if (n) {
+                return rb_entry(n, struct fs_vnode, node);
+        }
         return NULL;
         /* Lab 5 TODO End (Part 2) */
 }
@@ -127,7 +145,8 @@ int inc_ref_fs_vnode(void *private)
 {
         /* Lab 5 TODO Begin (Part 2) */
         /* Private is a fs_vnode */
-        UNUSED(private);
+        struct fs_vnode *vnode = (struct fs_vnode *)private;
+        vnode->refcnt++;
         return 0;
         /* Lab 5 TODO End (Part 2) */
 }
@@ -136,7 +155,18 @@ int dec_ref_fs_vnode(void *private)
 {
         /* Lab 5 TODO Begin (Part 2) */
         /* Private is a fs_vnode Decrement its refcnt */
-        UNUSED(private);
+        struct fs_vnode *vnode = (struct fs_vnode *)private;
+        int ret;
+
+        vnode->refcnt--;
+        if (vnode->refcnt == 0) {
+                ret = server_ops.close(
+                        vnode->private, vnode->type == FS_NODE_DIR, true);
+                if (ret)
+                        return ret;
+                pop_free_fs_vnode(vnode);
+        }
+
         return 0;
         /* Lab 5 TODO End (Part 2) */
 }

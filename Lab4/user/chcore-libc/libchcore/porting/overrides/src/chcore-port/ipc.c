@@ -53,11 +53,46 @@ struct ipc_msg {
         /* icb: ipc control block (not needed by the kernel) */
         ipc_struct_t *icb;
         struct ipc_response_hdr *response_hdr;
+        struct ipc_cap_transfer_meta *cap_meta;
         enum {
                 THREAD_SERVER,
                 THREAD_CLIENT,
         } thread_type;
 } __attribute__((aligned(sizeof(void *))));
+
+static inline struct ipc_cap_transfer_meta *ipc_fast_cap_meta(void *shm_ptr)
+{
+        return (struct ipc_cap_transfer_meta *)((char *)shm_ptr
+                                                + IPC_FAST_CAP_META_OFFSET);
+}
+
+static inline ipc_msg_t *ipc_fast_msg_buf(void *shm_ptr)
+{
+        return (ipc_msg_t *)((char *)shm_ptr + IPC_FAST_MSG_BUF_OFFSET);
+}
+
+static inline int ipc_fast_cap_meta_valid(struct ipc_cap_transfer_meta *meta)
+{
+        return meta != NULL && meta->hdr.magic == IPC_FAST_CAP_MAGIC
+               && meta->hdr.magic_inv == IPC_FAST_CAP_MAGIC_INV
+               && meta->hdr.version == IPC_FAST_CAP_VERSION;
+}
+
+static inline void ipc_fast_cap_meta_init(struct ipc_cap_transfer_meta *meta,
+                                          unsigned int call_cap_num)
+{
+        meta->hdr.magic = IPC_FAST_CAP_MAGIC;
+        meta->hdr.magic_inv = IPC_FAST_CAP_MAGIC_INV;
+        meta->hdr.version = IPC_FAST_CAP_VERSION;
+        meta->hdr.call_cap_num = call_cap_num;
+        meta->hdr.return_cap_num = 0;
+
+        for (unsigned int i = 0;
+             i < call_cap_num && i < IPC_FAST_CAP_MAX_TRANSFER;
+             i++) {
+                meta->call_caps[i].valid = 0;
+        }
+}
 
 /*
  * **fsm_ipc_struct** is an address that points to the per-thread
@@ -102,6 +137,7 @@ ipc_msg_t *ipc_create_msg_with_cap(ipc_struct_t *icb, unsigned int data_len,
         BUILD_BUG_ON(sizeof(ipc_msg_t) > SERVER_IPC_MSG_BUF_SIZE);
         ipc_msg_t *ipc_msg;
         unsigned long buf_len;
+        int use_fast_msg;
 
         if (unlikely(icb->conn_cap == 0)) {
                 /* Create the IPC connection on demand */
@@ -114,7 +150,8 @@ ipc_msg_t *ipc_create_msg_with_cap(ipc_struct_t *icb, unsigned int data_len,
         /* Grab the ipc lock before setting ipc msg */
         chcore_spin_lock(&(icb->lock));
 
-        buf_len = icb->shared_buf_len;
+        use_fast_msg = send_cap_num || data_len <= IPC_FAST_SHM_AVAILABLE;
+        buf_len = use_fast_msg ? IPC_FAST_SHM_AVAILABLE : icb->shared_buf_len;
 
         /*
          * Check the total length of data and caps.
@@ -130,16 +167,29 @@ ipc_msg_t *ipc_create_msg_with_cap(ipc_struct_t *icb, unsigned int data_len,
                 goto out_unlock;
         }
 
-        ipc_msg = (ipc_msg_t *)malloc(sizeof(ipc_msg_t));
-
-        if (!ipc_msg) {
-                goto out_unlock;
+        if (use_fast_msg) {
+                ipc_msg = ipc_fast_msg_buf((void *)icb->shared_buf);
+        } else {
+                ipc_msg = (ipc_msg_t *)malloc(sizeof(ipc_msg_t));
+                if (!ipc_msg) {
+                        goto out_unlock;
+                }
         }
 
         ipc_msg->data_ptr = SHM_PTR_TO_CUSTOM_DATA_PTR(icb->shared_buf);
         ipc_msg->max_data_len = buf_len;
         ipc_msg->send_cap_num = send_cap_num;
         ipc_msg->response_hdr = (struct ipc_response_hdr *)icb->shared_buf;
+        if (send_cap_num) {
+                ipc_msg->cap_meta = ipc_fast_cap_meta((void *)icb->shared_buf);
+                ipc_fast_cap_meta_init(ipc_msg->cap_meta, send_cap_num);
+        } else {
+                if (use_fast_msg) {
+                        ipc_fast_cap_meta((void *)icb->shared_buf)->hdr.magic =
+                                0;
+                }
+                ipc_msg->cap_meta = NULL;
+        }
         ipc_msg->icb = icb;
         ipc_msg->thread_type = THREAD_CLIENT;
                   
@@ -157,6 +207,10 @@ void __ipc_server_init_raw_msg(ipc_msg_t *ipc_msg, void *shm_ptr, unsigned int m
         ipc_msg->max_data_len = max_data_len;
         ipc_msg->send_cap_num = cap_num;
         ipc_msg->response_hdr = (struct ipc_response_hdr *)shm_ptr;
+        ipc_msg->cap_meta = ipc_fast_cap_meta(shm_ptr);
+        if (!ipc_fast_cap_meta_valid(ipc_msg->cap_meta)) {
+                ipc_msg->cap_meta = NULL;
+        }
         ipc_msg->thread_type = THREAD_SERVER;
 }
 
@@ -189,6 +243,24 @@ int ipc_set_msg_data(ipc_msg_t *ipc_msg, void *data, unsigned int offset,
 cap_t ipc_get_msg_cap(ipc_msg_t *ipc_msg, unsigned int cap_slot_index)
 {
         cap_t cap, conn_cap;
+        struct ipc_cap_transfer_entry *entry;
+        unsigned int cap_num;
+
+        if (ipc_msg->cap_meta != NULL
+            && cap_slot_index < IPC_FAST_CAP_MAX_TRANSFER) {
+                if (ipc_msg->thread_type == THREAD_SERVER) {
+                        entry = ipc_msg->cap_meta->call_caps;
+                        cap_num = ipc_msg->cap_meta->hdr.call_cap_num;
+                } else {
+                        entry = ipc_msg->cap_meta->return_caps;
+                        cap_num = ipc_msg->cap_meta->hdr.return_cap_num;
+                }
+
+                if (cap_slot_index < cap_num && entry[cap_slot_index].valid) {
+                        return entry[cap_slot_index].cap;
+                }
+        }
+
         if (ipc_msg->thread_type == THREAD_SERVER)
                 conn_cap = CONN_CAP_SERVER;
         else
@@ -217,14 +289,40 @@ int ipc_set_msg_cap_restrict(ipc_msg_t *ipc_msg, unsigned int cap_slot_index,
 {
         int ret;
         cap_t conn_cap;
+        struct ipc_cap_transfer_entry *entry;
 
         if (ipc_msg->thread_type == THREAD_SERVER)
                 conn_cap = CONN_CAP_SERVER;
         else
                 conn_cap = ipc_msg->icb->conn_cap;
-        
+
+        if (ipc_msg->cap_meta != NULL
+            && cap_slot_index < IPC_FAST_CAP_MAX_TRANSFER) {
+                if (ipc_msg->thread_type == THREAD_SERVER) {
+                        entry = ipc_msg->cap_meta->return_caps;
+                        if (ipc_msg->cap_meta->hdr.return_cap_num
+                            <= cap_slot_index) {
+                                ipc_msg->cap_meta->hdr.return_cap_num =
+                                        cap_slot_index + 1;
+                        }
+                } else {
+                        entry = ipc_msg->cap_meta->call_caps;
+                        if (ipc_msg->cap_meta->hdr.call_cap_num
+                            <= cap_slot_index) {
+                                ipc_msg->cap_meta->hdr.call_cap_num =
+                                        cap_slot_index + 1;
+                        }
+                }
+
+                entry[cap_slot_index].cap = cap;
+                entry[cap_slot_index].mask = mask;
+                entry[cap_slot_index].rest = rest;
+                entry[cap_slot_index].valid = 1;
+                return 0;
+        }
+
         while ((ret = usys_ipc_set_cap_restrict(conn_cap, cap_slot_index, cap, mask, rest)) < 0) {
-               if (ret != -EIPCRETRY) {
+                if (ret != -EIPCRETRY) {
                         printf("%s failed, ret = %d\n", __func__, cap);
                         return -1;
                 }
@@ -240,6 +338,9 @@ unsigned int ipc_get_msg_send_cap_num(ipc_msg_t *ipc_msg)
 void ipc_set_msg_send_cap_num(ipc_msg_t *ipc_msg, unsigned int cap_num)
 {
         ipc_msg->send_cap_num = cap_num;
+        if (ipc_msg->cap_meta != NULL) {
+                ipc_msg->cap_meta->hdr.call_cap_num = cap_num;
+        }
 }
 
 unsigned int ipc_get_msg_return_cap_num(ipc_msg_t *ipc_msg)
@@ -250,6 +351,9 @@ unsigned int ipc_get_msg_return_cap_num(ipc_msg_t *ipc_msg)
 void ipc_set_msg_return_cap_num(ipc_msg_t *ipc_msg, unsigned int cap_num)
 {
         ipc_msg->response_hdr->return_cap_num = cap_num;
+        if (ipc_msg->cap_meta != NULL) {
+                ipc_msg->cap_meta->hdr.return_cap_num = cap_num;
+        }
 }
 
 int ipc_destroy_msg(ipc_msg_t *ipc_msg)
@@ -257,7 +361,9 @@ int ipc_destroy_msg(ipc_msg_t *ipc_msg)
         /* Release the ipc lock */
         chcore_spin_unlock(&(ipc_msg->icb->lock));
 
-        free(ipc_msg);
+        if (ipc_msg != ipc_fast_msg_buf((void *)ipc_msg->icb->shared_buf)) {
+                free(ipc_msg);
+        }
 
         return 0;
 }
@@ -350,9 +456,10 @@ void *register_cb(void *ipc_handler)
                 &handler_tid, NULL, ipc_handler, (void *)NO_ARG);
         BUG_ON(server_thread_cap < 0);
 #ifndef CHCORE_ARCH_X86_64
-        ipc_register_cb_return(server_thread_cap,
-                               (unsigned long)ipc_shadow_thread_exit_routine,
-                               shm_addr);
+        ipc_register_cb_return(
+                server_thread_cap,
+                (unsigned long)ipc_shadow_thread_exit_routine,
+                shm_addr);
 #else
         ipc_register_cb_return(
                 server_thread_cap,
@@ -445,13 +552,126 @@ struct client_shm_config {
         unsigned long shm_addr;
 };
 
+#define IPC_CLIENT_CACHE_SIZE 128
+
+struct ipc_client_cache_entry {
+        pthread_t owner;
+        cap_t server_thread_cap;
+        ipc_struct_t *master;
+        unsigned int refcnt;
+};
+
+static struct ipc_client_cache_entry ipc_client_cache[IPC_CLIENT_CACHE_SIZE];
+static volatile int ipc_client_cache_lock;
+
+static void ipc_struct_copy(ipc_struct_t *dst, ipc_struct_t *src);
+static int ipc_client_close_connection_raw(ipc_struct_t *ipc_struct);
+
+static ipc_struct_t *ipc_dup_struct(ipc_struct_t *src)
+{
+        ipc_struct_t *dst;
+
+        dst = malloc(sizeof(*dst));
+        if (dst == NULL)
+                return NULL;
+
+        ipc_struct_copy(dst, src);
+        dst->lock = 0;
+        return dst;
+}
+
+static ipc_struct_t *ipc_client_cache_lookup(cap_t server_thread_cap)
+{
+        pthread_t owner;
+        ipc_struct_t *master = NULL;
+        ipc_struct_t *copy;
+
+        owner = pthread_self();
+        chcore_spin_lock(&ipc_client_cache_lock);
+        for (int i = 0; i < IPC_CLIENT_CACHE_SIZE; i++) {
+                if (ipc_client_cache[i].master != NULL
+                    && ipc_client_cache[i].owner == owner
+                    && ipc_client_cache[i].server_thread_cap
+                               == server_thread_cap) {
+                        ipc_client_cache[i].refcnt++;
+                        master = ipc_client_cache[i].master;
+                        break;
+                }
+        }
+        chcore_spin_unlock(&ipc_client_cache_lock);
+
+        if (master == NULL)
+                return NULL;
+
+        copy = ipc_dup_struct(master);
+        if (copy != NULL)
+                return copy;
+
+        chcore_spin_lock(&ipc_client_cache_lock);
+        for (int i = 0; i < IPC_CLIENT_CACHE_SIZE; i++) {
+                if (ipc_client_cache[i].master == master
+                    && ipc_client_cache[i].owner == owner
+                    && ipc_client_cache[i].server_thread_cap
+                               == server_thread_cap) {
+                        ipc_client_cache[i].refcnt--;
+                        break;
+                }
+        }
+        chcore_spin_unlock(&ipc_client_cache_lock);
+        return NULL;
+}
+
+static ipc_struct_t *ipc_client_cache_insert(cap_t server_thread_cap,
+                                             ipc_struct_t *master)
+{
+        pthread_t owner;
+        ipc_struct_t *copy;
+        int free_slot = -1;
+
+        copy = ipc_dup_struct(master);
+        if (copy == NULL)
+                return master;
+
+        owner = pthread_self();
+        chcore_spin_lock(&ipc_client_cache_lock);
+        for (int i = 0; i < IPC_CLIENT_CACHE_SIZE; i++) {
+                if (ipc_client_cache[i].master == NULL && free_slot < 0)
+                        free_slot = i;
+                if (ipc_client_cache[i].master != NULL
+                    && ipc_client_cache[i].owner == owner
+                    && ipc_client_cache[i].server_thread_cap
+                               == server_thread_cap) {
+                        ipc_client_cache[i].refcnt++;
+                        ipc_struct_copy(copy, ipc_client_cache[i].master);
+                        copy->lock = 0;
+                        chcore_spin_unlock(&ipc_client_cache_lock);
+                        ipc_client_close_connection_raw(master);
+                        return copy;
+                }
+        }
+
+        if (free_slot >= 0) {
+                ipc_client_cache[free_slot].owner = owner;
+                ipc_client_cache[free_slot].server_thread_cap =
+                        server_thread_cap;
+                ipc_client_cache[free_slot].master = master;
+                ipc_client_cache[free_slot].refcnt = 1;
+                chcore_spin_unlock(&ipc_client_cache_lock);
+                return copy;
+        }
+        chcore_spin_unlock(&ipc_client_cache_lock);
+
+        free(copy);
+        return master;
+}
+
 /*
  * A client thread can register itself for multiple times.
  *
  * The returned ipc_struct_t is from heap,
  * so the callee needs to free it.
  */
-ipc_struct_t *ipc_register_client(cap_t server_thread_cap)
+static ipc_struct_t *ipc_register_client_uncached(cap_t server_thread_cap)
 {
         cap_t conn_cap;
         ipc_struct_t *client_ipc_struct;
@@ -527,7 +747,23 @@ out_free_client_ipc_struct:
         return NULL;
 }
 
-int ipc_client_close_connection(ipc_struct_t *ipc_struct)
+ipc_struct_t *ipc_register_client(cap_t server_thread_cap)
+{
+        ipc_struct_t *cached;
+        ipc_struct_t *master;
+
+        cached = ipc_client_cache_lookup(server_thread_cap);
+        if (cached != NULL)
+                return cached;
+
+        master = ipc_register_client_uncached(server_thread_cap);
+        if (master == NULL)
+                return NULL;
+
+        return ipc_client_cache_insert(server_thread_cap, master);
+}
+
+static int ipc_client_close_connection_raw(ipc_struct_t *ipc_struct)
 {
         int ret;
         while (1) {
@@ -546,6 +782,42 @@ int ipc_client_close_connection(ipc_struct_t *ipc_struct)
         free(ipc_struct);
 out:
         return ret;
+}
+
+int ipc_client_close_connection(ipc_struct_t *ipc_struct)
+{
+        pthread_t owner;
+        ipc_struct_t *master = NULL;
+        int cached = 0;
+
+        owner = pthread_self();
+        chcore_spin_lock(&ipc_client_cache_lock);
+        for (int i = 0; i < IPC_CLIENT_CACHE_SIZE; i++) {
+                if (ipc_client_cache[i].master != NULL
+                    && ipc_client_cache[i].owner == owner
+                    && ipc_client_cache[i].master->conn_cap
+                               == ipc_struct->conn_cap
+                    && ipc_client_cache[i].master->shared_buf
+                               == ipc_struct->shared_buf) {
+                        cached = 1;
+                        if (--ipc_client_cache[i].refcnt == 0) {
+                                master = ipc_client_cache[i].master;
+                                ipc_client_cache[i].master = NULL;
+                                ipc_client_cache[i].refcnt = 0;
+                        }
+                        break;
+                }
+        }
+        chcore_spin_unlock(&ipc_client_cache_lock);
+
+        if (!cached)
+                return ipc_client_close_connection_raw(ipc_struct);
+
+        free(ipc_struct);
+        if (master != NULL)
+                return ipc_client_close_connection_raw(master);
+
+        return 0;
 }
 
 /* Client uses **ipc_call** to issue an IPC request */

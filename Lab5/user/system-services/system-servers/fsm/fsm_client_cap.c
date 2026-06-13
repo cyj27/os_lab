@@ -10,6 +10,7 @@
  * Mulan PSL v2 for more details.
  */
 
+#include "chcore/container/list.h"
 #include <malloc.h>
 #include <string.h>
 #include "fsm_client_cap.h"
@@ -26,7 +27,28 @@ int fsm_set_client_cap(badge_t client_badge, cap_t cap)
          * should allocate the node if it's not present or get the
          * fs_client_cap_node. Iterate through the cap_table and place the cap
          * in an empty slot of the cap_table and returns its ordinal.*/
-        return 0;
+        struct fsm_client_cap_node *node;
+        int mount_id = -1;
+        for_each_in_list(node, struct fsm_client_cap_node, node, &fsm_client_cap_table) {
+                if (node->client_badge == client_badge){
+                        if (node->cap_num < 16) {
+                                mount_id = node->cap_num;
+                                node->cap_table[mount_id] = cap;
+                                node->cap_num++;
+                }
+                        return mount_id;
+                }
+        }
+        node = malloc(sizeof(*node));
+        BUG_ON(node == NULL);
+        node->client_badge = client_badge;
+        node->cap_num = 0;
+        memset(node->cap_table, 0, sizeof(node->cap_table));
+        list_add(&node->node, &fsm_client_cap_table);
+        mount_id = node->cap_num;
+        node->cap_table[mount_id] = cap;
+        node->cap_num++;
+        return mount_id;
         /* Lab 5 TODO End (Part 1) */
 }
 
@@ -36,6 +58,19 @@ int fsm_get_client_cap(badge_t client_badge, cap_t cap)
         /* Lab 5 TODO Begin (Part 1) */
         /* HINT: Perform the same behavior as fsm_set_client_cap and gets the
          * cap from the cap_table if it exists. */
+        struct fsm_client_cap_node *node;
+        int mount_id = -1;
+        for_each_in_list(node, struct fsm_client_cap_node, node, &fsm_client_cap_table) {
+                if (node->client_badge == client_badge){
+                        for (int i = 0; i < node->cap_num; i++) {
+                                if (node->cap_table[i] == cap) {
+                                        mount_id = i;
+                                        return mount_id;
+                                }
+                        }
+                        break;
+                }
+        }
         return -1;
         /* Lab 5 TODO End (Part 1) */
 }

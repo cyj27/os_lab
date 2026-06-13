@@ -12,7 +12,9 @@
 
 #include "chcore/proc.h"
 #include "fcntl.h"
+#include "stdbool.h"
 #include "sys/stat.h"
+#include "sys/types.h"
 #include <errno.h>
 #include <pthread.h>
 #include <chcore/bug.h>
@@ -122,19 +124,62 @@ int fs_wrapper_open(badge_t client_badge, ipc_msg_t *ipc_msg,
         /* Check the fr permission and open flag if necessary */
 
         /* Use server_ops to open the file */
+        int new_fd = fr->open.new_fd;
+        char *path = fr->open.pathname;
+        mode_t mode = fr->open.mode;
+        int flags = fr->open.flags;
+        int ret;
+        int entry;
+        ino_t vnode_id;
+        off_t vnode_size;
+        int vnode_type;
+        void *private;
+        char *path_copy;
+        struct fs_vnode *vnode;
 
+        ret = server_ops.open(path, flags, mode, &vnode_id, &vnode_size, &vnode_type, &private);
+        if (ret < 0) {
+                return ret;
+        }
         /* Check if the vnode_id is in rb tree.*/
-
+        vnode = get_fs_vnode_by_id(vnode_id);
         /* If not, create a new vnode and insert it into the tree. */
-
+        if (vnode == NULL) {
+                vnode = alloc_fs_vnode(vnode_id, vnode_type, vnode_size, private);
+                if (vnode == NULL) {
+                        server_ops.close(private, vnode_type == FS_NODE_DIR, true);
+                        return -ENOMEM;
+                }
+                push_fs_vnode(vnode);
+        } 
         /* If yes, then close the newly opened vnode and increment the refcnt of
          * present vnode */
-
+        else {
+                server_ops.close(private, vnode_type == FS_NODE_DIR, true);
+                inc_ref_fs_vnode(vnode);
+        }
         /* Alloc a server_entry and assign the vnode and client generated
          * fd(fr->xxx) to it (Part3 Server fid)*/
-
+        entry = alloc_entry();
+        if (entry < 0) {
+                dec_ref_fs_vnode(vnode);
+                return -EMFILE;
+        }
+        path_copy = strdup(path);
+        if (path_copy == NULL) {
+                free(server_entrys[entry]);
+                server_entrys[entry] = NULL;
+                dec_ref_fs_vnode(vnode);
+                return -ENOMEM;
+        }
+        assign_entry(server_entrys[entry], flags, 0, 1, path_copy, vnode);
+        ret = fs_wrapper_set_server_entry(client_badge, new_fd, entry);
+        if (ret < 0) {
+                free_entry(entry);
+                dec_ref_fs_vnode(vnode);
+                return ret;
+        }
         /* Return the client fd */
-
         return 0;
         /* Lab 5 TODO End (Part 4)*/
 }
@@ -143,13 +188,25 @@ int fs_wrapper_close(badge_t client_badge, ipc_msg_t *ipc_msg,
                      struct fs_request *fr)
 {
         /* Lab 5 TODO Begin (Part 4)*/
+        int fid = fr->close.fd;
+        if (fid < 0 || fid >= MAX_SERVER_ENTRY_NUM)
+                return -EBADF;
 
-        /* Find the server_entry by client fd and client badge */
+        struct server_entry *entry = server_entrys[fid];
+        if (entry == NULL)
+                return -EBADF;
 
         /* Decrement the server_entry refcnt */
+        entry->refcnt--;
 
-        /* If refcnt is 0, free the server_entry and decrement the vnode
-         * refcnt*/
+        /* If refcnt is 0, free the server_entry and decrement the vnode refcnt */
+        if (entry->refcnt == 0) {
+                struct fs_vnode *vnode = entry->vnode;
+
+                fs_wrapper_clear_server_entry(client_badge, fid);
+                free_entry(fid);
+                return dec_ref_fs_vnode(vnode);
+        }
 
         return 0;
         /* Lab 5 TODO End (Part 4)*/
@@ -170,7 +227,16 @@ static int __fs_wrapper_read_core(struct server_entry *server_entry, void *buf,
         /* Do check the boundary of the file and file permission correctly Check
          * Posix Standard for further references. */
         /* You also should update the offset of the server_entry offset */
-        return 0;
+        if ((server_entry->flags & O_ACCMODE) == O_WRONLY) {
+                return -EBADF;
+        }
+        struct fs_vnode *vnode = server_entry->vnode;
+        if (offset >= vnode->size) {
+                return 0;
+        }
+        if (offset + size > vnode->size) size = vnode->size - offset;
+        ssize_t ret = server_ops.read(vnode->private, offset, size, buf);
+        return ret;
         /* Lab 5 TODO End (Part 4)*/
 }
 
@@ -253,7 +319,16 @@ static int __fs_wrapper_write_core(struct server_entry *server_entry, void *buf,
         /* Do check the boundary of the file and file permission correctly Check
          * Posix Standard for further references. */
         /* You also should update the offset of the server_entry offset */
-        return 0;
+        struct fs_vnode *vnode = server_entry->vnode;
+        if ((server_entry->flags & O_ACCMODE) == O_RDONLY) {
+                return -EBADF;
+        }
+        ssize_t ret = server_ops.write(vnode->private, offset, size, buf);
+        if (ret > 0) {
+                if (offset + ret > vnode->size)
+                        vnode->size = offset + ret;
+        }
+        return ret;
         /* Lab 5 TODO End (Part 4)*/
 }
 
@@ -300,8 +375,8 @@ int fs_wrapper_pwrite(ipc_msg_t *ipc_msg, struct fs_request *fr)
 
         /* pwrite should not affect offset, but must update file size */
         if (ret > 0) {
-                if (offset + size > server_entrys[fd]->vnode->size) {
-                        server_entrys[fd]->vnode->size = (size_t)offset + size;
+                if (offset + ret > server_entrys[fd]->vnode->size) {
+                        server_entrys[fd]->vnode->size = offset + ret;
                 }
         }
 
@@ -370,6 +445,33 @@ int fs_wrapper_lseek(ipc_msg_t *ipc_msg, struct fs_request *fr)
 {
         /* Lab 5 TODO Begin (Part 4)*/
         /* Check the posix standard. Adjust the server_entry content.*/
+        int fd = fr->lseek.fd;
+        off_t offset = fr->lseek.offset;
+        int whence = fr->lseek.whence;
+        if (fd_type_invalid(fd, true)) {
+                return -EBADF;
+        }
+        struct server_entry *entry = server_entrys[fd];
+        switch (whence) {
+        case SEEK_SET:
+                if (offset < 0)
+                        return -EINVAL;
+                entry->offset = offset;
+                break;
+        case SEEK_CUR:
+                if (entry->offset + offset < 0)
+                        return -EINVAL;
+                entry->offset += offset;
+                break;
+        case SEEK_END:
+                if (entry->vnode->size + offset < 0)
+                        return -EINVAL;
+                entry->offset = entry->vnode->size + offset;
+                break;
+        default:
+                return -EINVAL;
+        }
+        fr->lseek.ret = entry->offset;
         return 0;
         /* Lab 5 TODO End (Part 4)*/
 }

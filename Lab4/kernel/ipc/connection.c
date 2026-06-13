@@ -59,6 +59,7 @@
 #include <object/memory.h>
 #include <sched/context.h>
 #include <common/util.h>
+#include <uapi/ipc.h>
 
 /*
  * Overall, a server thread that declares a serivce with this interface
@@ -245,6 +246,9 @@ static int create_connection(struct thread *client, struct thread *server,
          * instead of issuing an IPC.
          */
         conn->state = CONN_INCOME_STOPPED;
+        conn->fast_cap_meta = false;
+        conn->server_cap_buf_num = 0;
+        conn->client_cap_buf_num = 0;
         conn->current_client_thread = client;
         /*
          * The register_cb_thread in server will assign the
@@ -360,6 +364,116 @@ static inline int unlock_ipc_handler_thread(struct ipc_connection *conn)
         unlock(&handler_config->ipc_lock);
 
         return 0;
+}
+
+static inline bool ipc_fast_cap_header_valid(
+        struct ipc_cap_transfer_meta_header *hdr)
+{
+        return hdr->magic == IPC_FAST_CAP_MAGIC
+               && hdr->magic_inv == IPC_FAST_CAP_MAGIC_INV
+               && hdr->version == IPC_FAST_CAP_VERSION;
+}
+
+static inline vaddr_t ipc_fast_cap_meta_uaddr(vaddr_t shm_uaddr, size_t shm_size)
+{
+        return shm_uaddr + shm_size - sizeof(struct ipc_cap_transfer_meta);
+}
+
+static int ipc_read_fast_cap_header(vaddr_t shm_uaddr, size_t shm_size,
+                                    struct ipc_cap_transfer_meta_header *hdr)
+{
+        vaddr_t meta_uaddr;
+
+        if (shm_size < sizeof(struct ipc_response_hdr)
+                       + sizeof(struct ipc_cap_transfer_meta)) {
+                return -EINVAL;
+        }
+
+        meta_uaddr = ipc_fast_cap_meta_uaddr(shm_uaddr, shm_size);
+        if (check_user_addr_range(meta_uaddr, sizeof(*hdr)) != 0) {
+                return -EINVAL;
+        }
+
+        return copy_from_user(hdr, (void *)meta_uaddr, sizeof(*hdr));
+}
+
+static inline vaddr_t ipc_fast_cap_entries_uaddr(vaddr_t shm_uaddr,
+                                                 size_t shm_size,
+                                                 bool is_return)
+{
+        vaddr_t meta_uaddr = ipc_fast_cap_meta_uaddr(shm_uaddr, shm_size);
+
+        if (is_return)
+                return meta_uaddr
+                       + offsetof(struct ipc_cap_transfer_meta, return_caps);
+
+        return meta_uaddr + offsetof(struct ipc_cap_transfer_meta, call_caps);
+}
+
+static int ipc_read_fast_cap_entries(
+        vaddr_t shm_uaddr,
+        size_t shm_size,
+        bool is_return,
+        struct ipc_cap_transfer_entry *entries,
+        unsigned int cap_num)
+{
+        size_t len;
+        vaddr_t entries_uaddr;
+
+        if (shm_size < sizeof(struct ipc_response_hdr)
+                       + sizeof(struct ipc_cap_transfer_meta)
+            || cap_num > IPC_FAST_CAP_MAX_TRANSFER) {
+                return -EINVAL;
+        }
+
+        len = cap_num * sizeof(*entries);
+        entries_uaddr =
+                ipc_fast_cap_entries_uaddr(shm_uaddr, shm_size, is_return);
+        if (check_user_addr_range(entries_uaddr, len) != 0) {
+                return -EINVAL;
+        }
+
+        return copy_from_user(entries, (void *)entries_uaddr, len);
+}
+
+static int ipc_write_fast_cap_entries(
+        vaddr_t shm_uaddr,
+        size_t shm_size,
+        bool is_return,
+        struct ipc_cap_transfer_entry *entries,
+        unsigned int cap_num)
+{
+        size_t len;
+        vaddr_t entries_uaddr;
+
+        if (shm_size < sizeof(struct ipc_response_hdr)
+                       + sizeof(struct ipc_cap_transfer_meta)
+            || cap_num > IPC_FAST_CAP_MAX_TRANSFER) {
+                return -EINVAL;
+        }
+
+        len = cap_num * sizeof(*entries);
+        entries_uaddr =
+                ipc_fast_cap_entries_uaddr(shm_uaddr, shm_size, is_return);
+        if (check_user_addr_range(entries_uaddr, len) != 0) {
+                return -EINVAL;
+        }
+
+        return copy_to_user((void *)entries_uaddr, entries, len);
+}
+
+static inline size_t ipc_server_data_size(struct ipc_connection *conn)
+{
+        if (conn->fast_cap_meta
+            && conn->shm.shm_size >= sizeof(struct ipc_response_hdr)
+                                     + sizeof(struct ipc_cap_transfer_meta)
+                                     + IPC_FAST_MSG_BUF_SIZE) {
+                return conn->shm.shm_size - sizeof(struct ipc_response_hdr)
+                       - sizeof(struct ipc_cap_transfer_meta)
+                       - IPC_FAST_MSG_BUF_SIZE;
+        }
+
+        return conn->shm.shm_size;
 }
 
 static void ipc_thread_migrate_to_server(struct ipc_connection *conn,
@@ -585,7 +699,7 @@ static int ipc_send_cap(struct cap_group *source_cap_group,
         cap_t dest_cap;
 
         if (!(start_idx <= start_idx + cap_num
-              && start_idx + cap_num < MAX_CAP_TRANSFER)) {
+              && start_idx + cap_num <= MAX_CAP_TRANSFER)) {
                 r = -EINVAL;
                 goto out_fail;
         }
@@ -651,6 +765,8 @@ unsigned long sys_ipc_call(cap_t conn_cap, unsigned int cap_num)
 {
         struct ipc_connection *conn;
         int r = 0;
+        struct ipc_cap_transfer_meta_header fast_hdr;
+        struct ipc_cap_transfer_entry fast_entries[IPC_FAST_CAP_MAX_TRANSFER];
 
         if (cap_num > MAX_CAP_TRANSFER) {
                 return -EINVAL;
@@ -686,8 +802,68 @@ unsigned long sys_ipc_call(cap_t conn_cap, unsigned int cap_num)
         if ((r = lock_ipc_handler_thread(conn)) != 0)
                 goto out_obj_put;
 
-        for (int i = 0; i < MAX_CAP_TRANSFER; i++) {
+        conn->fast_cap_meta = false;
+        if (cap_num != 0
+            && ipc_read_fast_cap_header(conn->shm.client_shm_uaddr,
+                                        conn->shm.shm_size,
+                                        &fast_hdr) == 0
+            && ipc_fast_cap_header_valid(&fast_hdr)) {
+                conn->fast_cap_meta = true;
+        }
+
+        for (int i = cap_num; i < conn->server_cap_buf_num; i++) {
                 conn->server_cap_buf[i].valid = false;
+        }
+        conn->server_cap_buf_num = 0;
+
+        if (conn->fast_cap_meta && cap_num != 0) {
+                r = ipc_read_fast_cap_entries(conn->shm.client_shm_uaddr,
+                                              conn->shm.shm_size,
+                                              false,
+                                              fast_entries,
+                                              cap_num);
+                if (r != 0 || fast_hdr.call_cap_num < cap_num) {
+                        r = -EINVAL;
+                        goto out_unlock_handler;
+                }
+
+                for (int i = 0; i < cap_num; i++) {
+                        if (!fast_entries[i].valid) {
+                                r = -ECAPBILITY;
+                                goto out_unlock_handler;
+                        }
+                        conn->client_cap_buf[i].cap = fast_entries[i].cap;
+                        conn->client_cap_buf[i].mask = fast_entries[i].mask;
+                        conn->client_cap_buf[i].rest = fast_entries[i].rest;
+                        conn->client_cap_buf[i].valid = true;
+                }
+
+                r = ipc_send_cap(current_cap_group,
+                                 conn->server_handler_thread->cap_group,
+                                 conn->client_cap_buf,
+                                 conn->server_cap_buf,
+                                 0,
+                                 cap_num);
+                if (r < 0) {
+                        goto out_unlock_handler;
+                }
+                conn->server_cap_buf_num = cap_num;
+
+                for (int i = 0; i < cap_num; i++) {
+                        fast_entries[i].cap = conn->server_cap_buf[i].cap;
+                        fast_entries[i].mask = CAP_RIGHT_NO_RIGHTS;
+                        fast_entries[i].rest = CAP_RIGHT_NO_RIGHTS;
+                        fast_entries[i].valid = true;
+                }
+
+                r = ipc_write_fast_cap_entries(conn->shm.client_shm_uaddr,
+                                               conn->shm.shm_size,
+                                               false,
+                                               fast_entries,
+                                               cap_num);
+                if (r != 0) {
+                        goto out_unlock_handler;
+                }
         }
 
         /*
@@ -698,10 +874,15 @@ unsigned long sys_ipc_call(cap_t conn_cap, unsigned int cap_num)
 
         /* Call server (handler thread) */
         ipc_thread_migrate_to_server(
-                conn, conn->shm.server_shm_uaddr, conn->shm.shm_size, cap_num);
+                conn,
+                conn->shm.server_shm_uaddr,
+                ipc_server_data_size(conn),
+                cap_num);
 
         BUG("should not reach here\n");
 
+out_unlock_handler:
+        unlock_ipc_handler_thread(conn);
 out_obj_put:
         unlock(&conn->ownership);
         obj_put(conn);
@@ -713,6 +894,7 @@ int sys_ipc_return(unsigned long ret, unsigned int cap_num)
         struct ipc_server_handler_config *handler_config;
         struct ipc_connection *conn;
         struct thread *client;
+        struct ipc_cap_transfer_entry fast_entries[IPC_FAST_CAP_MAX_TRANSFER];
 
         /* Get the currently active connection */
         handler_config = (struct ipc_server_handler_config *)
@@ -720,6 +902,9 @@ int sys_ipc_return(unsigned long ret, unsigned int cap_num)
         conn = handler_config->active_conn;
 
         if (!conn)
+                return -EINVAL;
+
+        if (cap_num > MAX_CAP_TRANSFER)
                 return -EINVAL;
 
         /*
@@ -794,10 +979,36 @@ int sys_ipc_return(unsigned long ret, unsigned int cap_num)
                 }
         }
 
+        for (int i = cap_num; i < conn->client_cap_buf_num; i++) {
+                conn->client_cap_buf[i].valid = false;
+        }
+        conn->client_cap_buf_num = 0;
+
         if (cap_num != 0) {
-                for (int i = 0; i < MAX_CAP_TRANSFER; i++) {
-                        conn->client_cap_buf[i].valid = false;
+                if (conn->fast_cap_meta) {
+                        int r = ipc_read_fast_cap_entries(
+                                conn->shm.server_shm_uaddr,
+                                conn->shm.shm_size,
+                                true,
+                                fast_entries,
+                                cap_num);
+                        if (r != 0)
+                                return r;
+
+                        for (int i = 0; i < cap_num; i++) {
+                                if (!fast_entries[i].valid)
+                                        return -ECAPBILITY;
+
+                                conn->server_cap_buf[i].cap =
+                                        fast_entries[i].cap;
+                                conn->server_cap_buf[i].mask =
+                                        fast_entries[i].mask;
+                                conn->server_cap_buf[i].rest =
+                                        fast_entries[i].rest;
+                                conn->server_cap_buf[i].valid = true;
+                        }
                 }
+
                 int r = ipc_send_cap(current_cap_group,
                                      conn->current_client_thread->cap_group,
                                      conn->server_cap_buf,
@@ -806,6 +1017,25 @@ int sys_ipc_return(unsigned long ret, unsigned int cap_num)
                                      cap_num);
                 if (r < 0)
                         return r;
+                conn->client_cap_buf_num = cap_num;
+
+                if (conn->fast_cap_meta) {
+                        for (int i = 0; i < cap_num; i++) {
+                                fast_entries[i].cap =
+                                        conn->client_cap_buf[i].cap;
+                                fast_entries[i].mask = CAP_RIGHT_NO_RIGHTS;
+                                fast_entries[i].rest = CAP_RIGHT_NO_RIGHTS;
+                                fast_entries[i].valid = true;
+                        }
+                        r = ipc_write_fast_cap_entries(
+                                conn->shm.server_shm_uaddr,
+                                conn->shm.shm_size,
+                                true,
+                                fast_entries,
+                                cap_num);
+                        if (r != 0)
+                                return r;
+                }
         }
 
         /* Set active_conn to NULL since the IPC will finish sooner */
@@ -1125,10 +1355,12 @@ int sys_ipc_set_cap(cap_t conn_cap, int index, cap_t cap,
                 conn->server_cap_buf[index].cap = cap;
                 conn->server_cap_buf[index].mask = mask;
                 conn->server_cap_buf[index].rest = rest;
+                conn->server_cap_buf[index].valid = true;
         } else {
                 conn->client_cap_buf[index].cap = cap;
                 conn->client_cap_buf[index].mask = mask;
                 conn->client_cap_buf[index].rest = rest;
+                conn->client_cap_buf[index].valid = true;
         }
 
 out_unlock:
